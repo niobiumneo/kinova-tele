@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Kinova VR + Desktop Teleop (Tool Frame)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #1a1a1a; font-family: sans-serif; }
+        #overlay {
+            position: absolute; top: 20px; left: 20px; color: white; z-index: 10;
+            pointer-events: none; max-width: 90vw;
+        }
+        #button-container { pointer-events: auto; }
+        #debug {
+            margin-top: 12px; font-size: 12px; line-height: 1.4; color: #eee;
+            background: rgba(0,0,0,0.6); padding: 8px 10px; border-radius: 6px;
+            font-family: monospace; white-space: pre;
+        }
+        .ok { color: #7CFC00; }
+        .bad { color: #ff5555; }
+        .warn { color: orange; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "/static/three.module.js",
+                "three/addons/webxr/VRButton.js": "/static/VRButton.js"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="overlay">
+        <h2>Kinova Gen3 Teleop (Tool Frame)</h2>
+        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold RIGHT TRIGGER & move hand relative to gripper.</p>
+        <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
+        <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
+        <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
+        
+        <div id="button-container" style="margin-top: 15px;"></div>
+        <div id="debug">Waiting for XR or Keyboard Input...</div>
+    </div>
+
+    <script>
+        window.robotSocket = null;
+        const host = window.location.host;
+        const wsStatusEl = document.getElementById('ws-status');
+
+        if (host) {
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const socketUrl = `${protocol}//${host}/ws`;
+                
+                window.robotSocket = new WebSocket(socketUrl);
+
+                window.robotSocket.onopen = () => {
+                    wsStatusEl.textContent = "WS: connected";
+                    wsStatusEl.style.color = "lime";
+                };
+                window.robotSocket.onerror = (e) => {
+                    wsStatusEl.textContent = "WS: ERROR";
+                    wsStatusEl.style.color = "red";
+                };
+                window.robotSocket.onclose = (e) => {
+                    wsStatusEl.textContent = `WS: closed (${e.code})`;
+                    wsStatusEl.style.color = "orange";
+                };
+            } catch (error) {
+                wsStatusEl.textContent = "WS: blocked by browser";
+                wsStatusEl.style.color = "red";
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+        const xrStatusEl = document.getElementById('xr-status');
+        const debugEl = document.getElementById('debug');
+
+        let scene, camera, renderer;
+        const MAX_OFFSET_METERS = 0.15;
+
+        // --- Keyboard State ---
+        const keys = { w: false, a: false, s: false, d: false, ' ': false, 'Shift': false };
+        window.addEventListener('keydown', (e) => { 
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key)) keys[key] = true; 
+            if (e.key === ' ') keys[' '] = true;
+            if (e.key === 'Shift') keys['Shift'] = true;
+        });
+        window.addEventListener('keyup', (e) => { 
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key)) keys[key] = false; 
+            if (e.key === ' ') keys[' '] = false;
+            if (e.key === 'Shift') keys['Shift'] = false;
+        });
+
+        // --- VR Clutch State ---
+        let wasTriggerPressed = false;
+        const engagePos = new THREE.Vector3();
+        const currentPos = new THREE.Vector3();
+        let rightControllerFound = false;
+        let lastDelta = new THREE.Vector3();
+        let debugThrottle = 0;
+        let last_vx = 0, last_vy = 0, last_vz = 0;
+
+        init();
+
+        async function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222); 
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 10);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            if (!navigator.xr) {
+                xrStatusEl.textContent = "XR: navigator.xr is undefined";
+                xrStatusEl.style.color = "red";
+            } else {
+                try {
+                    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+                    if (supported) {
+                        xrStatusEl.textContent = "XR: immersive-vr supported! Click 'ENTER VR' below.";
+                        xrStatusEl.style.color = "lime";
+                    } else {
+                        xrStatusEl.textContent = "XR: immersive-vr NOT supported";
+                        xrStatusEl.style.color = "red";
+                    }
+                } catch (e) {
+                    xrStatusEl.textContent = "XR check failed: " + e.message;
+                }
+            }
+
+            document.getElementById('button-container').appendChild(VRButton.createButton(renderer));
+
+            scene.add(new THREE.GridHelper(10, 10, 0x444444, 0x222222));
+            scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+
+            renderer.setAnimationLoop(renderFrame);
+        }
+
+        function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+        function renderFrame(timestamp, frame) {
+            console.log(`[${new Date().toLocaleString()}] Render!`);
+            console.time("Timer");
+            let outVx = 0, outVy = 0, outVz = 0;
+            let triggerPressed = false;
+            let msg_type = "keyboard";
+            rightControllerFound = false;
+
+            // 1. Check for VR Input first
+            if (renderer.xr.isPresenting && frame) {
+                const session = renderer.xr.getSession();
+                const refSpace = renderer.xr.getReferenceSpace();
+
+                if (session && refSpace) {
+                    for (const source of session.inputSources) {
+                        if (source.handedness !== 'right' || !source.gamepad) continue;
+                        rightControllerFound = true;
+
+                        const gp = source.gamepad;
+                        triggerPressed = !!(gp.buttons[0] && gp.buttons[0].pressed);
+
+                        const space = source.gripSpace || source.targetRaySpace;
+                        if (space) {
+                            const pose = frame.getPose(space, refSpace);
+                            if (pose) {
+                                currentPos.set(
+                                    pose.transform.position.x,
+                                    pose.transform.position.y,
+                                    pose.transform.position.z
+                                );
+                            }
+                        }
+                    }
+                }
+                
+
+                if (triggerPressed) {
+                    msg_type = "XR"
+                    if (!wasTriggerPressed) {
+                        engagePos.copy(currentPos);
+                    }
+
+                    const delta = currentPos.clone().sub(engagePos);
+                    lastDelta.copy(delta);
+
+                    // --- TOOL FRAME MAPPING ---
+                    // +Z is pointing straight out of the gripper.
+                    // Move VR hand away (negative Z delta) -> robot drives straight forward
+                    const robot_dz = -delta.z; 
+                    const robot_dx = delta.x;  // Move hand right -> robot slides right
+                    const robot_dy = delta.y;  // Move hand up -> robot slides up
+
+                    outVx = clamp(robot_dx, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
+                    outVy = clamp(robot_dy, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
+                    outVz = clamp(robot_dz, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
+                } else {
+                    lastDelta.set(0, 0, 0);
+                }
+
+                wasTriggerPressed = triggerPressed;
+            } 
+            // 2. If not in VR, check Desktop Keyboard Input
+            else {
+                msg_type = "keyboard"
+                wasTriggerPressed = false;
+                if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
+                if (keys['Shift']) outVz = -1.0;    // 'S' = Backw / MAX_OFFSET_METERSard
+                if (keys['a']) outVy = 1.0;     // 'A' = Left
+                if (keys['d']) outVy = -1.0;    // 'D' = Right
+                if (keys['w']) outVx = 1.0;     // Space = Up (or modify based on your exact flange rotation)
+                if (keys['s']) outVx = -1.0;// Shift = Down
+            }
+
+            // 3. Send commands over the network
+            if (window.robotSocket && window.robotSocket.readyState === WebSocket.OPEN) {
+                // if (outVx !== 0 || outVy !== 0 || outVz !== 0 || last_vx !== 0 || last_vy !== 0 || last_vz !== 0) {
+                window.robotSocket.send(JSON.stringify({msg: msg_type, vx: outVx, vy: outVy, vz: outVz }));
+                // }
+            }
+            last_vx = outVx; last_vy = outVy; last_vz = outVz;
+
+            // 4. Update the debug overlay
+            debugThrottle++;
+            if (debugThrottle % 10 === 0) {
+                const source = renderer.xr.isPresenting ? 'VR Hand' : 'Keyboard';
+                debugEl.innerHTML =
+                    `Input Source: <span class="ok">${source}</span>\n` +
+                    `VR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
+                    `VR Trigger: ${triggerPressed ? '<span class="ok">PRESSED</span>' : 'released'}\n` +
+                    `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
+            }
+
+            // renderer.render(scene, camera);
+            console.timeEnd("Timer"); 
+        }
+    </script>
+</body>
+</html>
+
+
+<!-- need to read the robot state repeatedly to use the position of the tool in order to get the position of the hand. I need to match the position of the robot to the hand
+ with a PID or P control -->

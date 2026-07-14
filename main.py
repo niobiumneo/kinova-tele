@@ -31,11 +31,16 @@ MAX_VELOCITY = 0.15  # m/s, per axis. Keep this low until you've verified direct
 # Change this line to set the origin to the robot's gripper
 REFERENCE_FRAME = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
 
+# Kortex gripper positions are normalized: 0.0 is open and 1.0 is closed.
+GRIPPER_OPEN_POSITION = 0.0
+GRIPPER_CLOSED_POSITION = 1.0
+
 # If the WebSocket goes quiet (headset takes off, wifi hiccup, browser tab suspends)
 # for longer than this, we force-stop the robot even if we never got an explicit
-# zero command. This is a backstop for the "release trigger -> stop" logic living
-# entirely in the browser.
-WATCHDOG_TIMEOUT_S = 0.0001
+# zero command. The short queue-drain timeout keeps only the newest motion command
+# without conflating it with the actual motion watchdog duration.
+QUEUE_DRAIN_TIMEOUT_S = 0.001
+MOTION_WATCHDOG_TIMEOUT_S = 0.1
 
 gain = 2
 
@@ -111,6 +116,25 @@ class KinovaController:
         except Exception as e:
             print(f"\nSendTwistCommand failed: {e}")
 
+    def send_gripper_position(self, position):
+        """Move the configured end-effector gripper to a normalized position."""
+        if not self.base:
+            return
+
+        target = max(0.0, min(1.0, float(position)))
+        command = Base_pb2.GripperCommand()
+        command.mode = Base_pb2.GRIPPER_POSITION
+
+        finger = command.gripper.finger.add()
+        finger.finger_identifier = 1
+        finger.value = target
+
+        try:
+            self.base.SendGripperCommand(command)
+            print(f"\nGripper target: {target:.2f}")
+        except Exception as e:
+            print(f"\nSendGripperCommand failed: {e}")
+
     def get_current_robot_pose(self):
         """
         Fetches and prints the current Cartesian pose of the Kinova robot.
@@ -167,24 +191,47 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("\n[WS] Quest client connected successfully!")
     ref_robot_pose = deepcopy(robot.get_current_robot_pose())
+    last_gripper_action = None
     try:
-        start = time()
+        last_motion_message_time = time()
+        watchdog_stopped_motion = False
         while True:
             data = None
             while True:
                 try:
-                    check = await asyncio.wait_for(websocket.receive_text(), timeout=WATCHDOG_TIMEOUT_S)
+                    check = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=QUEUE_DRAIN_TIMEOUT_S,
+                    )
                     data = check
                 except asyncio.TimeoutError:
                     break
 
-            # print("DATA!")
-            # print(data)
-            if data == None:
+            if data is None:
+                if (
+                    not watchdog_stopped_motion
+                    and time() - last_motion_message_time > MOTION_WATCHDOG_TIMEOUT_S
+                ):
+                    robot.send_cartesian_velocity(0, 0, 0)
+                    watchdog_stopped_motion = True
                 continue
             
             payload = json.loads(data)
             msg_type = payload.get("msg", None)
+
+            gripper_action = payload.get("gripper")
+            if (
+                gripper_action in ("open", "close")
+                and gripper_action != last_gripper_action
+            ):
+                target = (
+                    GRIPPER_OPEN_POSITION
+                    if gripper_action == "open"
+                    else GRIPPER_CLOSED_POSITION
+                )
+                robot.send_gripper_position(target)
+                last_gripper_action = gripper_action
+
             if msg_type != None:
                 vx = payload.get("vx", 0.0)
                 vy = payload.get("vy", 0.0)
@@ -209,10 +256,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         robot.send_cartesian_velocity(x_speed, y_speed, z_speed)
                     else:
                         robot.send_cartesian_velocity(0,0,0)
-                start = time()
-            elif time() - start > 0.1:
-                robot.send_cartesian_velocity(0,0,0)
-                start = time()
+                last_motion_message_time = time()
+                watchdog_stopped_motion = False
 
             
     except WebSocketDisconnect:

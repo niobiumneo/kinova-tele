@@ -33,7 +33,7 @@
 
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Tool Frame)</h2>
-        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold RIGHT TRIGGER & move hand relative to gripper.</p>
+        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold RIGHT TRIGGER & move hand. A closes the gripper; B opens it.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
@@ -106,6 +106,11 @@
         let lastDelta = new THREE.Vector3();
         let debugThrottle = 0;
         let last_vx = 0, last_vy = 0, last_vz = 0;
+        const QUEST_A_BUTTON = 4;
+        const QUEST_B_BUTTON = 5;
+        let wasAPressed = false;
+        let wasBPressed = false;
+        let gripperAction = null;
 
         init();
 
@@ -153,6 +158,8 @@
             console.time("Timer");
             let outVx = 0, outVy = 0, outVz = 0;
             let triggerPressed = false;
+            let aPressed = false;
+            let bPressed = false;
             let msg_type = "keyboard";
             rightControllerFound = false;
 
@@ -168,6 +175,8 @@
 
                         const gp = source.gamepad;
                         triggerPressed = !!(gp.buttons[0] && gp.buttons[0].pressed);
+                        aPressed = !!(gp.buttons[QUEST_A_BUTTON] && gp.buttons[QUEST_A_BUTTON].pressed);
+                        bPressed = !!(gp.buttons[QUEST_B_BUTTON] && gp.buttons[QUEST_B_BUTTON].pressed);
 
                         const space = source.gripSpace || source.targetRaySpace;
                         if (space) {
@@ -182,6 +191,18 @@
                         }
                     }
                 }
+
+                // Use rising edges so holding a button does not generate new targets.
+                // Keep the selected target in every payload so queue coalescing cannot
+                // discard a one-frame gripper command.
+                if (aPressed && !wasAPressed) {
+                    gripperAction = "close";
+                } else if (bPressed && !wasBPressed) {
+                    gripperAction = "open";
+                }
+
+                wasAPressed = aPressed;
+                wasBPressed = bPressed;
                 
 
                 if (triggerPressed) {
@@ -213,6 +234,8 @@
             else {
                 msg_type = "keyboard"
                 wasTriggerPressed = false;
+                wasAPressed = false;
+                wasBPressed = false;
                 if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
                 if (keys['Shift']) outVz = -1.0;    // 'S' = Backw / MAX_OFFSET_METERSard
                 if (keys['a']) outVy = 1.0;     // 'A' = Left
@@ -224,7 +247,13 @@
             // 3. Send commands over the network
             if (window.robotSocket && window.robotSocket.readyState === WebSocket.OPEN) {
                 // if (outVx !== 0 || outVy !== 0 || outVz !== 0 || last_vx !== 0 || last_vy !== 0 || last_vz !== 0) {
-                window.robotSocket.send(JSON.stringify({msg: msg_type, vx: outVx, vy: outVy, vz: outVz }));
+                window.robotSocket.send(JSON.stringify({
+                    msg: msg_type,
+                    vx: outVx,
+                    vy: outVy,
+                    vz: outVz,
+                    gripper: gripperAction
+                }));
                 // }
             }
             last_vx = outVx; last_vy = outVy; last_vz = outVz;
@@ -237,6 +266,8 @@
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `VR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
                     `VR Trigger: ${triggerPressed ? '<span class="ok">PRESSED</span>' : 'released'}\n` +
+                    `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
+                    `Gripper target: ${gripperAction || 'unchanged'}\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
             }
 

@@ -33,7 +33,7 @@
 
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Tool Frame)</h2>
-        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold RIGHT TRIGGER & move hand. A closes the gripper; B opens it.</p>
+        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold SIDE GRIP to move. INDEX TRIGGER sets gripper position. A closes and B opens one step.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
@@ -99,18 +99,22 @@
         });
 
         // --- VR Clutch State ---
-        let wasTriggerPressed = false;
+        let wasGripPressed = false;
         const engagePos = new THREE.Vector3();
         const currentPos = new THREE.Vector3();
         let rightControllerFound = false;
         let lastDelta = new THREE.Vector3();
         let debugThrottle = 0;
-        let last_vx = 0, last_vy = 0, last_vz = 0;
+        const QUEST_TRIGGER_BUTTON = 0;
+        const QUEST_GRIP_BUTTON = 1;
         const QUEST_A_BUTTON = 4;
         const QUEST_B_BUTTON = 5;
+        const GRIPPER_STEP = 0.10;
+        const TRIGGER_TAKEOVER_DEADBAND = 0.02;
         let wasAPressed = false;
         let wasBPressed = false;
-        let gripperAction = null;
+        let lastTriggerPosition = null;
+        let gripperTarget = null;
 
         init();
 
@@ -157,7 +161,8 @@
             console.log(`[${new Date().toLocaleString()}] Render!`);
             console.time("Timer");
             let outVx = 0, outVy = 0, outVz = 0;
-            let triggerPressed = false;
+            let gripPressed = false;
+            let triggerPosition = null;
             let aPressed = false;
             let bPressed = false;
             let msg_type = "keyboard";
@@ -174,7 +179,10 @@
                         rightControllerFound = true;
 
                         const gp = source.gamepad;
-                        triggerPressed = !!(gp.buttons[0] && gp.buttons[0].pressed);
+                        const trigger = gp.buttons[QUEST_TRIGGER_BUTTON];
+                        const grip = gp.buttons[QUEST_GRIP_BUTTON];
+                        triggerPosition = clamp(trigger ? trigger.value : 0.0, 0.0, 1.0);
+                        gripPressed = !!(grip && grip.pressed);
                         aPressed = !!(gp.buttons[QUEST_A_BUTTON] && gp.buttons[QUEST_A_BUTTON].pressed);
                         bPressed = !!(gp.buttons[QUEST_B_BUTTON] && gp.buttons[QUEST_B_BUTTON].pressed);
 
@@ -192,22 +200,34 @@
                     }
                 }
 
-                // Use rising edges so holding a button does not generate new targets.
-                // Keep the selected target in every payload so queue coalescing cannot
-                // discard a one-frame gripper command.
+                // The analog trigger owns the target whenever it physically moves.
+                // A/B steps persist while the trigger remains stationary.
+                if (
+                    triggerPosition !== null
+                    && (
+                        lastTriggerPosition === null
+                        || Math.abs(triggerPosition - lastTriggerPosition) >= TRIGGER_TAKEOVER_DEADBAND
+                    )
+                ) {
+                    gripperTarget = triggerPosition;
+                    lastTriggerPosition = triggerPosition;
+                }
+
                 if (aPressed && !wasAPressed) {
-                    gripperAction = "close";
+                    const currentTarget = gripperTarget === null ? 0.0 : gripperTarget;
+                    gripperTarget = clamp(currentTarget + GRIPPER_STEP, 0.0, 1.0);
                 } else if (bPressed && !wasBPressed) {
-                    gripperAction = "open";
+                    const currentTarget = gripperTarget === null ? 0.0 : gripperTarget;
+                    gripperTarget = clamp(currentTarget - GRIPPER_STEP, 0.0, 1.0);
                 }
 
                 wasAPressed = aPressed;
                 wasBPressed = bPressed;
                 
 
-                if (triggerPressed) {
+                if (gripPressed) {
                     msg_type = "XR"
-                    if (!wasTriggerPressed) {
+                    if (!wasGripPressed) {
                         engagePos.copy(currentPos);
                     }
 
@@ -228,12 +248,12 @@
                     lastDelta.set(0, 0, 0);
                 }
 
-                wasTriggerPressed = triggerPressed;
+                wasGripPressed = gripPressed;
             } 
             // 2. If not in VR, check Desktop Keyboard Input
             else {
                 msg_type = "keyboard"
-                wasTriggerPressed = false;
+                wasGripPressed = false;
                 wasAPressed = false;
                 wasBPressed = false;
                 if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
@@ -246,17 +266,14 @@
 
             // 3. Send commands over the network
             if (window.robotSocket && window.robotSocket.readyState === WebSocket.OPEN) {
-                // if (outVx !== 0 || outVy !== 0 || outVz !== 0 || last_vx !== 0 || last_vy !== 0 || last_vz !== 0) {
                 window.robotSocket.send(JSON.stringify({
                     msg: msg_type,
                     vx: outVx,
                     vy: outVy,
                     vz: outVz,
-                    gripper: gripperAction
+                    gripper_position: gripperTarget
                 }));
-                // }
             }
-            last_vx = outVx; last_vy = outVy; last_vz = outVz;
 
             // 4. Update the debug overlay
             debugThrottle++;
@@ -265,9 +282,10 @@
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `VR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
-                    `VR Trigger: ${triggerPressed ? '<span class="ok">PRESSED</span>' : 'released'}\n` +
+                    `Side grip clutch: ${gripPressed ? '<span class="ok">ENGAGED</span>' : 'released'}\n` +
+                    `Trigger position: ${triggerPosition === null ? 'unavailable' : triggerPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
-                    `Gripper target: ${gripperAction || 'unchanged'}\n` +
+                    `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
             }
 

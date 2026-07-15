@@ -34,6 +34,8 @@ REFERENCE_FRAME = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
 # Kortex gripper positions are normalized: 0.0 is open and 1.0 is closed.
 GRIPPER_OPEN_POSITION = 0.0
 GRIPPER_CLOSED_POSITION = 1.0
+GRIPPER_COMMAND_INTERVAL_S = 0.05
+GRIPPER_POSITION_DEADBAND = 0.02
 
 # If the WebSocket goes quiet (headset takes off, wifi hiccup, browser tab suspends)
 # for longer than this, we force-stop the robot even if we never got an explicit
@@ -119,7 +121,7 @@ class KinovaController:
     def send_gripper_position(self, position):
         """Move the configured end-effector gripper to a normalized position."""
         if not self.base:
-            return
+            return False
 
         target = max(0.0, min(1.0, float(position)))
         command = Base_pb2.GripperCommand()
@@ -132,8 +134,10 @@ class KinovaController:
         try:
             self.base.SendGripperCommand(command)
             print(f"\nGripper target: {target:.2f}")
+            return True
         except Exception as e:
             print(f"\nSendGripperCommand failed: {e}")
+            return False
 
     def get_current_robot_pose(self):
         """
@@ -191,7 +195,8 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("\n[WS] Quest client connected successfully!")
     ref_robot_pose = deepcopy(robot.get_current_robot_pose())
-    last_gripper_action = None
+    last_gripper_position = None
+    last_gripper_command_time = 0.0
     try:
         last_motion_message_time = time()
         watchdog_stopped_motion = False
@@ -219,18 +224,36 @@ async def websocket_endpoint(websocket: WebSocket):
             payload = json.loads(data)
             msg_type = payload.get("msg", None)
 
-            gripper_action = payload.get("gripper")
-            if (
-                gripper_action in ("open", "close")
-                and gripper_action != last_gripper_action
+            gripper_position = payload.get("gripper_position")
+            if isinstance(gripper_position, (int, float)) and not isinstance(
+                gripper_position,
+                bool,
             ):
-                target = (
-                    GRIPPER_OPEN_POSITION
-                    if gripper_action == "open"
-                    else GRIPPER_CLOSED_POSITION
+                target = max(
+                    GRIPPER_OPEN_POSITION,
+                    min(GRIPPER_CLOSED_POSITION, float(gripper_position)),
                 )
-                robot.send_gripper_position(target)
-                last_gripper_action = gripper_action
+
+                # Snap the ends of the trigger range to fully open/closed.
+                if target <= GRIPPER_POSITION_DEADBAND / 2:
+                    target = GRIPPER_OPEN_POSITION
+                elif target >= GRIPPER_CLOSED_POSITION - GRIPPER_POSITION_DEADBAND / 2:
+                    target = GRIPPER_CLOSED_POSITION
+
+                now = time()
+                position_changed = (
+                    last_gripper_position is None
+                    or abs(target - last_gripper_position)
+                    >= GRIPPER_POSITION_DEADBAND
+                )
+                command_interval_elapsed = (
+                    now - last_gripper_command_time >= GRIPPER_COMMAND_INTERVAL_S
+                )
+
+                if position_changed and command_interval_elapsed:
+                    last_gripper_command_time = now
+                    if robot.send_gripper_position(target):
+                        last_gripper_position = target
 
             if msg_type != None:
                 vx = payload.get("vx", 0.0)

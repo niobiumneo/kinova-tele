@@ -32,8 +32,10 @@
 <body>
 
     <div id="overlay">
-        <h2>Kinova Gen3 Teleop (Tool Frame)</h2>
+        <h2>Kinova Gen3 Teleop (Workspace Limited)</h2>
         <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold SIDE GRIP to move. INDEX TRIGGER sets gripper position. A closes and B opens one step.</p>
+        <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click SIDE GRIP without moving your hand. Press SIDE GRIP again to cancel.</p>
+        <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> Base-frame X/Y are limited to a fixed 4 ft × 4 ft area in front. Z remains enabled. The controller vibrates near an X/Y wall.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
@@ -44,6 +46,7 @@
 
     <script>
         window.robotSocket = null;
+        window.latestWorkspaceFeedback = null;
         const host = window.location.host;
         const wsStatusEl = document.getElementById('ws-status');
 
@@ -62,9 +65,21 @@
                     wsStatusEl.textContent = "WS: ERROR";
                     wsStatusEl.style.color = "red";
                 };
+                window.robotSocket.onmessage = (event) => {
+                    try {
+                        const feedback = JSON.parse(event.data);
+                        if (feedback.type === 'workspace') {
+                            feedback.receivedAtMs = performance.now();
+                            window.latestWorkspaceFeedback = feedback;
+                        }
+                    } catch (_) {
+                        // Ignore non-JSON or unrelated server messages.
+                    }
+                };
                 window.robotSocket.onclose = (e) => {
                     wsStatusEl.textContent = `WS: closed (${e.code})`;
                     wsStatusEl.style.color = "orange";
+                    window.latestWorkspaceFeedback = null;
                 };
             } catch (error) {
                 wsStatusEl.textContent = "WS: blocked by browser";
@@ -111,10 +126,21 @@
         const QUEST_B_BUTTON = 5;
         const GRIPPER_STEP = 0.10;
         const TRIGGER_TAKEOVER_DEADBAND = 0.02;
+        const HAPTIC_PULSE_INTERVAL_MS = 80;
+        const HAPTIC_PULSE_DURATION_MS = 90;
+        const HAPTIC_FEEDBACK_MAX_AGE_MS = 250;
+        const HOME_TAP_MAX_DURATION_MS = 220;
+        const HOME_DOUBLE_TAP_GAP_MS = 350;
+        const HOME_TAP_MAX_TRAVEL_M = 0.008;
         let wasAPressed = false;
         let wasBPressed = false;
         let lastTriggerPosition = null;
         let gripperTarget = null;
+        let lastHapticPulseTime = 0;
+        let gripPressStartedAt = 0;
+        const gripPressStartPos = new THREE.Vector3();
+        let lastValidGripTapReleasedAt = -Infinity;
+        let lastAutoHomeState = 'idle';
 
         init();
 
@@ -157,6 +183,72 @@
 
         function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+        function playHapticPulse(gamepad, intensity, durationMs) {
+            try {
+                let actuator = null;
+                if (gamepad.hapticActuators && gamepad.hapticActuators.length > 0) {
+                    actuator = gamepad.hapticActuators[0];
+                } else if (typeof gamepad.getHapticActuator === 'function') {
+                    actuator = gamepad.getHapticActuator(0);
+                } else if (gamepad.vibrationActuator) {
+                    actuator = gamepad.vibrationActuator;
+                }
+
+                if (!actuator) return;
+
+                let result = null;
+                if (typeof actuator.pulse === 'function') {
+                    result = actuator.pulse(intensity, durationMs);
+                } else if (typeof actuator.playEffect === 'function') {
+                    result = actuator.playEffect('dual-rumble', {
+                        duration: durationMs,
+                        strongMagnitude: intensity,
+                        weakMagnitude: intensity
+                    });
+                }
+
+                if (result && typeof result.catch === 'function') {
+                    result.catch(() => {});
+                }
+            } catch (_) {
+                // Haptics are optional and must never interrupt robot control.
+            }
+        }
+
+        function updateWorkspaceHaptics(gamepad, gripPressed, timestamp) {
+            const feedback = window.latestWorkspaceFeedback;
+            if (!gamepad || !gripPressed || !feedback) return;
+            if (performance.now() - feedback.receivedAtMs > HAPTIC_FEEDBACK_MAX_AGE_MS) return;
+
+            const intensity = clamp(Number(feedback.haptic_intensity) || 0.0, 0.0, 1.0);
+            if (intensity <= 0.0) return;
+            if (timestamp - lastHapticPulseTime < HAPTIC_PULSE_INTERVAL_MS) return;
+
+            lastHapticPulseTime = timestamp;
+            playHapticPulse(
+                gamepad,
+                Math.max(0.15, intensity),
+                HAPTIC_PULSE_DURATION_MS
+            );
+        }
+
+        function updateAutoHomeHaptics(gamepad, timestamp) {
+            const feedback = window.latestWorkspaceFeedback;
+            if (!gamepad || !feedback) return;
+
+            const state = feedback.auto_home_state || 'idle';
+            if (state === lastAutoHomeState) return;
+
+            if (state === 'complete') {
+                lastHapticPulseTime = timestamp;
+                playHapticPulse(gamepad, 0.8, 180);
+            } else if (state === 'cancelled' || state === 'timeout') {
+                lastHapticPulseTime = timestamp;
+                playHapticPulse(gamepad, 0.35, 80);
+            }
+            lastAutoHomeState = state;
+        }
+
         function renderFrame(timestamp, frame) {
             console.log(`[${new Date().toLocaleString()}] Render!`);
             console.time("Timer");
@@ -165,6 +257,8 @@
             let triggerPosition = null;
             let aPressed = false;
             let bPressed = false;
+            let rightGamepad = null;
+            let homeRequestThisFrame = false;
             let msg_type = "keyboard";
             rightControllerFound = false;
 
@@ -179,6 +273,7 @@
                         rightControllerFound = true;
 
                         const gp = source.gamepad;
+                        rightGamepad = gp;
                         const trigger = gp.buttons[QUEST_TRIGGER_BUTTON];
                         const grip = gp.buttons[QUEST_GRIP_BUTTON];
                         triggerPosition = clamp(trigger ? trigger.value : 0.0, 0.0, 1.0);
@@ -223,7 +318,11 @@
 
                 wasAPressed = aPressed;
                 wasBPressed = bPressed;
-                
+
+                if (gripPressed && !wasGripPressed) {
+                    gripPressStartedAt = timestamp;
+                    gripPressStartPos.copy(currentPos);
+                }
 
                 if (gripPressed) {
                     msg_type = "XR"
@@ -248,7 +347,37 @@
                     lastDelta.set(0, 0, 0);
                 }
 
+                if (!gripPressed && wasGripPressed && rightControllerFound) {
+                    const pressDuration = timestamp - gripPressStartedAt;
+                    const handTravel = currentPos.distanceTo(gripPressStartPos);
+                    const validTap =
+                        pressDuration <= HOME_TAP_MAX_DURATION_MS
+                        && handTravel <= HOME_TAP_MAX_TRAVEL_M;
+
+                    if (validTap) {
+                        if (
+                            timestamp - lastValidGripTapReleasedAt
+                            <= HOME_DOUBLE_TAP_GAP_MS
+                        ) {
+                            homeRequestThisFrame = true;
+                            lastValidGripTapReleasedAt = -Infinity;
+                            lastHapticPulseTime = timestamp;
+                            playHapticPulse(rightGamepad, 1.0, 140);
+                        } else {
+                            lastValidGripTapReleasedAt = timestamp;
+                        }
+                    } else {
+                        lastValidGripTapReleasedAt = -Infinity;
+                    }
+                }
+
+                if (!rightControllerFound) {
+                    lastValidGripTapReleasedAt = -Infinity;
+                }
+
                 wasGripPressed = gripPressed;
+                updateWorkspaceHaptics(rightGamepad, gripPressed, timestamp);
+                updateAutoHomeHaptics(rightGamepad, timestamp);
             } 
             // 2. If not in VR, check Desktop Keyboard Input
             else {
@@ -256,6 +385,7 @@
                 wasGripPressed = false;
                 wasAPressed = false;
                 wasBPressed = false;
+                lastValidGripTapReleasedAt = -Infinity;
                 if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
                 if (keys['Shift']) outVz = -1.0;    // 'S' = Backw / MAX_OFFSET_METERSard
                 if (keys['a']) outVy = 1.0;     // 'A' = Left
@@ -271,7 +401,11 @@
                     vx: outVx,
                     vy: outVy,
                     vz: outVz,
-                    gripper_position: gripperTarget
+                    gripper_position: gripperTarget,
+                    grip_pressed: gripPressed,
+                    home_request: homeRequestThisFrame,
+                    xr_presenting: renderer.xr.isPresenting,
+                    controller_present: rightControllerFound
                 }));
             }
 
@@ -279,6 +413,13 @@
             debugThrottle++;
             if (debugThrottle % 10 === 0) {
                 const source = renderer.xr.isPresenting ? 'VR Hand' : 'Keyboard';
+                const workspaceFeedback = window.latestWorkspaceFeedback;
+                const workspaceText = workspaceFeedback
+                    ? `${(workspaceFeedback.distance_to_boundary_m * 100).toFixed(1)} cm to ${workspaceFeedback.nearest_boundary}${workspaceFeedback.at_limit ? ' (LIMIT)' : ''}`
+                    : 'waiting for robot feedback';
+                const homeText = workspaceFeedback
+                    ? `${workspaceFeedback.auto_home_state || 'idle'} (${((workspaceFeedback.auto_home_distance_m || 0) * 100).toFixed(1)} cm)`
+                    : 'waiting for robot feedback';
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `VR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
@@ -286,6 +427,8 @@
                     `Trigger position: ${triggerPosition === null ? 'unavailable' : triggerPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
+                    `Workspace: ${workspaceText}\n` +
+                    `Auto-home: ${homeText}\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
             }
 

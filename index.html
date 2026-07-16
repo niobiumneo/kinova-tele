@@ -34,7 +34,7 @@
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Workspace Limited)</h2>
         <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
-        <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER without moving your hand. Press INDEX TRIGGER again to cancel.</p>
+        <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> Base-frame X/Y are limited to a fixed 4 ft × 4 ft area in front. Z remains enabled. The controller vibrates near an X/Y wall.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
@@ -96,6 +96,9 @@
         const debugEl = document.getElementById('debug');
 
         let scene, camera, renderer;
+        // 1.25 means 4 cm of Quest hand travel requests 5 cm of robot travel.
+        // The scaled target is still capped by MAX_OFFSET_METERS below.
+        const VR_TRANSLATION_SCALE = 1.25;
         const MAX_OFFSET_METERS = 0.15;
 
         // --- Keyboard State ---
@@ -242,7 +245,12 @@
             if (state === 'complete') {
                 lastHapticPulseTime = timestamp;
                 playHapticPulse(gamepad, 0.8, 180);
-            } else if (state === 'cancelled' || state === 'timeout') {
+            } else if (
+                state === 'cancelled'
+                || state === 'timeout'
+                || state === 'aborted'
+                || state === 'workspace_blocked'
+            ) {
                 lastHapticPulseTime = timestamp;
                 playHapticPulse(gamepad, 0.35, 80);
             }
@@ -350,9 +358,21 @@
                     const robot_dx = delta.x;  // Move hand right -> robot slides right
                     const robot_dy = delta.y;  // Move hand up -> robot slides up
 
-                    outVx = clamp(robot_dx, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
-                    outVy = clamp(robot_dy, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
-                    outVz = clamp(robot_dz, -MAX_OFFSET_METERS, MAX_OFFSET_METERS);
+                    outVx = clamp(
+                        robot_dx * VR_TRANSLATION_SCALE,
+                        -MAX_OFFSET_METERS,
+                        MAX_OFFSET_METERS
+                    );
+                    outVy = clamp(
+                        robot_dy * VR_TRANSLATION_SCALE,
+                        -MAX_OFFSET_METERS,
+                        MAX_OFFSET_METERS
+                    );
+                    outVz = clamp(
+                        robot_dz * VR_TRANSLATION_SCALE,
+                        -MAX_OFFSET_METERS,
+                        MAX_OFFSET_METERS
+                    );
                 } else {
                     lastDelta.set(0, 0, 0);
                 }
@@ -436,7 +456,7 @@
                     ? `${(workspaceFeedback.distance_to_boundary_m * 100).toFixed(1)} cm to ${workspaceFeedback.nearest_boundary}${workspaceFeedback.at_limit ? ' (LIMIT)' : ''}`
                     : 'waiting for robot feedback';
                 const homeText = workspaceFeedback
-                    ? `${workspaceFeedback.auto_home_state || 'idle'} (${((workspaceFeedback.auto_home_distance_m || 0) * 100).toFixed(1)} cm)`
+                    ? `${workspaceFeedback.auto_home_state || 'idle'} (${(workspaceFeedback.auto_home_joint_error_deg || 0).toFixed(1)} deg max joint error)`
                     : 'waiting for robot feedback';
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
@@ -447,6 +467,7 @@
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Workspace: ${workspaceText}\n` +
                     `Auto-home: ${homeText}\n` +
+                    `VR translation scale: ${VR_TRANSLATION_SCALE.toFixed(2)}x\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
             }
         }

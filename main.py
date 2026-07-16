@@ -2,8 +2,9 @@ import json
 import os
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from math import isfinite, sqrt
+from math import isfinite
 from pathlib import Path
+from threading import Lock
 from time import time
 import asyncio
 import uvicorn
@@ -59,10 +60,8 @@ QUEUE_DRAIN_TIMEOUT_S = 0.001
 MOTION_WATCHDOG_TIMEOUT_S = 0.1
 
 POSITION_GAIN = 2.0
-AUTO_HOME_POSITION_GAIN = 1.5
-AUTO_HOME_MAX_VELOCITY_M_S = 0.08
-AUTO_HOME_POSITION_TOLERANCE_M = 0.01
-AUTO_HOME_TIMEOUT_S = 20.0
+AUTO_HOME_MAX_JOINT_VELOCITY_DEG_S = 10.0
+AUTO_HOME_TIMEOUT_S = 30.0
 
 
 def clamp(value, lower, upper):
@@ -81,25 +80,19 @@ def finite_command_value(payload, key):
     return value if isfinite(value) else 0.0
 
 
-def auto_home_velocity(pose, target_pose):
-    """Return a speed-limited straight-line velocity toward the startup pose."""
-    error_x = target_pose.tool_pose_x - pose.tool_pose_x
-    error_y = target_pose.tool_pose_y - pose.tool_pose_y
-    error_z = target_pose.tool_pose_z - pose.tool_pose_z
-    distance = sqrt(error_x**2 + error_y**2 + error_z**2)
+def max_joint_error_degrees(current_angles, target_angles):
+    """Return the largest wrapped actuator error in degrees."""
+    if len(current_angles) != len(target_angles):
+        raise ValueError(
+            "current and target joint configurations have different sizes"
+        )
 
-    if distance <= AUTO_HOME_POSITION_TOLERANCE_M:
-        return 0.0, 0.0, 0.0, distance
-
-    speed_scale = min(
-        AUTO_HOME_POSITION_GAIN,
-        AUTO_HOME_MAX_VELOCITY_M_S / distance,
-    )
-    return (
-        error_x * speed_scale,
-        error_y * speed_scale,
-        error_z * speed_scale,
-        distance,
+    return max(
+        (
+            abs((target - current + 180.0) % 360.0 - 180.0)
+            for current, target in zip(current_angles, target_angles)
+        ),
+        default=0.0,
     )
 
 
@@ -197,7 +190,12 @@ class KinovaController:
         self.transport = None
         self.router = None
         self.base = None
+        self.baseCyclic = None
         self.session_manager = None
+        self._home_action_lock = Lock()
+        self._home_action_state = "idle"
+        self._home_cancel_state = None
+        self._home_notification_handle = None
 
     def connect(self):
         try:
@@ -292,29 +290,127 @@ class KinovaController:
             print(f"\nSendGripperCommand failed: {e}")
             return False
 
-    def get_current_robot_pose(self):
-        """
-        Fetches and prints the current Cartesian pose of the Kinova robot.
-        """
-        # Get the cyclic feedback (this contains the real-time feedback)
+    def get_current_robot_state(self):
+        """Return one synchronized sample of tool pose and all joint angles."""
+        if self.baseCyclic is None:
+            raise RuntimeError("Kinova cyclic feedback is unavailable")
+
         feedback = self.baseCyclic.RefreshFeedback()
-        
-        # Extract Cartesian pose (end-effector)
-        base = feedback.base
-        # x = cartesian_pose.x
-        # y = cartesian_pose.y
-        # z = cartesian_pose.z
-        # theta_x = cartesian_pose.theta_x
-        # theta_y = cartesian_pose.theta_y
-        # theta_z = cartesian_pose.theta_z
-        
-        # print(f"Current Position (m): X = {x:.3f}, Y = {y:.3f}, Z = {z:.3f}")
-        # print(f"Current Orientation (deg): ThetaX = {theta_x:.3f}, ThetaY = {theta_y:.3f}, ThetaZ = {theta_z:.3f}")
-        
-        return base
+        joint_angles = tuple(
+            float(actuator.position) for actuator in feedback.actuators
+        )
+        if not joint_angles:
+            raise RuntimeError("Kinova returned no actuator feedback")
+        return feedback.base, joint_angles
+
+    def get_current_robot_pose(self):
+        pose, _joint_angles = self.get_current_robot_state()
+        return pose
+
+    def _set_home_action_state(self, state):
+        with self._home_action_lock:
+            self._home_action_state = state
+
+    def get_home_action_state(self):
+        with self._home_action_lock:
+            return self._home_action_state
+
+    def _on_home_action_notification(self, notification):
+        """Record Kortex completion on its notification callback thread."""
+        if notification.action_event == Base_pb2.ACTION_END:
+            self._set_home_action_state("complete")
+        elif notification.action_event == Base_pb2.ACTION_ABORT:
+            with self._home_action_lock:
+                self._home_action_state = (
+                    self._home_cancel_state or "aborted"
+                )
+
+    def finish_joint_home(self):
+        """Release the Kortex action subscription outside its callback."""
+        with self._home_action_lock:
+            notification_handle = self._home_notification_handle
+            self._home_notification_handle = None
+
+        if self.base and notification_handle is not None:
+            try:
+                self.base.Unsubscribe(notification_handle)
+            except Exception:
+                pass
+
+    def start_joint_home(self, target_joint_angles):
+        """Start a speed-limited waypoint to the captured startup joints."""
+        if not self.base or not target_joint_angles:
+            self._set_home_action_state("aborted")
+            return False
+
+        self.finish_joint_home()
+
+        try:
+            waypoint_list = Base_pb2.WaypointList()
+            waypoint_list.use_optimal_blending = False
+            waypoint = waypoint_list.waypoints.add()
+            waypoint.name = "Startup joint configuration"
+            waypoint.angular_waypoint.angles.extend(target_joint_angles)
+            waypoint.angular_waypoint.maximum_velocities.extend(
+                [AUTO_HOME_MAX_JOINT_VELOCITY_DEG_S]
+                * len(target_joint_angles)
+            )
+
+            validation = self.base.ValidateWaypointList(waypoint_list)
+            validation_errors = (
+                validation.trajectory_error_report.trajectory_error_elements
+            )
+            if validation_errors:
+                print(
+                    "\nAuto-home waypoint rejected by Kortex: "
+                    f"{len(validation_errors)} validation error(s)"
+                )
+                self._set_home_action_state("aborted")
+                return False
+
+            notification_handle = self.base.OnNotificationActionTopic(
+                self._on_home_action_notification,
+                Base_pb2.NotificationOptions(),
+            )
+            with self._home_action_lock:
+                self._home_notification_handle = notification_handle
+                self._home_cancel_state = None
+                self._home_action_state = "moving"
+
+            self.base.ExecuteWaypointTrajectory(waypoint_list)
+            print(
+                "\nAuto-home: returning all arm joints to the startup "
+                "configuration."
+            )
+            return True
+        except Exception as e:
+            print(f"\nFailed to start joint auto-home: {e}")
+            self._set_home_action_state("aborted")
+            self.finish_joint_home()
+            return False
+
+    def cancel_joint_home(self, state="cancelled"):
+        """Stop an active joint-space home action and record why it stopped."""
+        with self._home_action_lock:
+            was_active = self._home_action_state == "moving"
+            self._home_cancel_state = state
+
+        if was_active and self.base:
+            try:
+                self.base.StopAction()
+            except Exception:
+                try:
+                    self.base.Stop()
+                except Exception:
+                    pass
+
+        if was_active:
+            self._set_home_action_state(state)
+        self.finish_joint_home()
 
     def stop(self):
         if self.base:
+            self.cancel_joint_home()
             try:
                 self.base.Stop()
             except Exception:
@@ -324,16 +420,17 @@ class KinovaController:
 # Initialize Robot Controller
 robot = KinovaController()
 workspace = None
-home_pose = None
+home_joint_angles = None
 
 
 @asynccontextmanager
 async def lifespan(_app):
-    global home_pose, workspace
+    global home_joint_angles, workspace
     robot.connect()
     try:
         try:
-            initial_pose = deepcopy(robot.get_current_robot_pose())
+            initial_pose, initial_joint_angles = robot.get_current_robot_state()
+            initial_pose = deepcopy(initial_pose)
             workspace = PlanarWorkspace()
             if not workspace.contains(initial_pose):
                 raise RuntimeError(
@@ -342,17 +439,18 @@ async def lifespan(_app):
                     f"{initial_pose.tool_pose_y:.3f}) m, "
                     f"workspace={workspace.describe()}"
                 )
-            home_pose = deepcopy(initial_pose)
+            home_joint_angles = tuple(initial_joint_angles)
             print(f"Planar workspace active: {workspace.describe()}")
             print(
-                "Auto-home startup position: "
-                f"X={home_pose.tool_pose_x:.3f}, "
-                f"Y={home_pose.tool_pose_y:.3f}, "
-                f"Z={home_pose.tool_pose_z:.3f} m"
+                "Auto-home startup joint configuration: "
+                + ", ".join(
+                    f"J{index + 1}={angle:.2f} deg"
+                    for index, angle in enumerate(home_joint_angles)
+                )
             )
         except Exception as e:
             workspace = None
-            home_pose = None
+            home_joint_angles = None
             print(f"Failed to initialize workspace: {e}")
 
         yield
@@ -388,7 +486,7 @@ async def get_vr_button():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("\n[WS] Quest client connected successfully!")
-    if workspace is None or home_pose is None:
+    if workspace is None or home_joint_angles is None:
         await websocket.close(code=1011, reason="Robot workspace is unavailable")
         return
 
@@ -418,10 +516,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     not watchdog_stopped_motion
                     and time() - last_motion_message_time > MOTION_WATCHDOG_TIMEOUT_S
                 ):
-                    robot.send_cartesian_velocity(0, 0, 0)
-                    auto_home_active = False
-                    if auto_home_state == "moving":
+                    if auto_home_active:
+                        robot.cancel_joint_home("cancelled")
+                        auto_home_active = False
                         auto_home_state = "cancelled"
+                    else:
+                        robot.send_cartesian_velocity(0, 0, 0)
                     watchdog_stopped_motion = True
                 continue
             
@@ -467,17 +567,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 home_requested = payload.get("home_request") is True
                 xr_presenting = payload.get("xr_presenting") is True
                 controller_present = payload.get("controller_present") is True
-                pose = deepcopy(robot.get_current_robot_pose())
-                home_distance = sqrt(
-                    (home_pose.tool_pose_x - pose.tool_pose_x) ** 2
-                    + (home_pose.tool_pose_y - pose.tool_pose_y) ** 2
-                    + (home_pose.tool_pose_z - pose.tool_pose_z) ** 2
+                pose, current_joint_angles = robot.get_current_robot_state()
+                pose = deepcopy(pose)
+                home_joint_error_deg = max_joint_error_degrees(
+                    current_joint_angles,
+                    home_joint_angles,
                 )
 
-                if home_requested:
-                    auto_home_active = True
-                    auto_home_state = "moving"
-                    auto_home_started_at = time()
+                if home_requested and not auto_home_active:
+                    # Clear the last manual twist before handing control to the
+                    # high-level joint trajectory.
+                    robot.send_cartesian_velocity(0, 0, 0)
+                    auto_home_active = robot.start_joint_home(home_joint_angles)
+                    auto_home_state = robot.get_home_action_state()
+                    if auto_home_active:
+                        auto_home_started_at = time()
                     ref_robot_pose = deepcopy(pose)
 
                 keyboard_motion_requested = (
@@ -502,30 +606,32 @@ async def websocket_endpoint(websocket: WebSocket):
                     auto_home_active
                     and time() - auto_home_started_at > AUTO_HOME_TIMEOUT_S
                 )
+                auto_home_left_workspace = (
+                    auto_home_active and not workspace.contains(pose)
+                )
 
-                if cancel_auto_home or auto_home_timed_out:
+                if (
+                    cancel_auto_home
+                    or auto_home_timed_out
+                    or auto_home_left_workspace
+                ):
                     auto_home_active = False
-                    auto_home_state = (
-                        "timeout" if auto_home_timed_out else "cancelled"
-                    )
-                    robot.send_cartesian_velocity(0, 0, 0)
-                elif auto_home_active:
-                    home_vx, home_vy, home_vz, home_distance = auto_home_velocity(
-                        pose,
-                        home_pose,
-                    )
-                    if home_distance <= AUTO_HOME_POSITION_TOLERANCE_M:
-                        robot.send_cartesian_velocity(0, 0, 0)
-                        auto_home_active = False
-                        auto_home_state = "complete"
+                    if auto_home_timed_out:
+                        auto_home_state = "timeout"
+                    elif auto_home_left_workspace:
+                        auto_home_state = "workspace_blocked"
                     else:
-                        limited_twist = workspace.constrain_motion(
-                            pose,
-                            home_vx,
-                            home_vy,
-                            home_vz,
-                        )
-                        robot.send_cartesian_velocity(*limited_twist)
+                        auto_home_state = "cancelled"
+                    robot.cancel_joint_home(auto_home_state)
+                    ref_robot_pose = deepcopy(pose)
+                elif auto_home_active:
+                    action_state = robot.get_home_action_state()
+                    if action_state in ("complete", "aborted"):
+                        auto_home_active = False
+                        auto_home_state = action_state
+                        robot.finish_joint_home()
+                        ref_robot_pose = deepcopy(pose)
+                    else:
                         auto_home_state = "moving"
 
                 elif msg_type == "keyboard":
@@ -573,7 +679,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 feedback = workspace.feedback(pose)
                 feedback["auto_home_state"] = auto_home_state
-                feedback["auto_home_distance_m"] = home_distance
+                feedback["auto_home_joint_error_deg"] = home_joint_error_deg
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

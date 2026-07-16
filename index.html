@@ -33,8 +33,8 @@
 
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Workspace Limited)</h2>
-        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold SIDE GRIP to move. INDEX TRIGGER sets gripper position. A closes and B opens one step.</p>
-        <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click SIDE GRIP without moving your hand. Press SIDE GRIP again to cancel.</p>
+        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>VR:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
+        <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER without moving your hand. Press INDEX TRIGGER again to cancel.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> Base-frame X/Y are limited to a fixed 4 ft × 4 ft area in front. Z remains enabled. The controller vibrates near an X/Y wall.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
@@ -114,7 +114,7 @@
         });
 
         // --- VR Clutch State ---
-        let wasGripPressed = false;
+        let wasMotionClutchPressed = false;
         const engagePos = new THREE.Vector3();
         const currentPos = new THREE.Vector3();
         let rightControllerFound = false;
@@ -125,7 +125,7 @@
         const QUEST_A_BUTTON = 4;
         const QUEST_B_BUTTON = 5;
         const GRIPPER_STEP = 0.10;
-        const TRIGGER_TAKEOVER_DEADBAND = 0.02;
+        const GRIPPER_ANALOG_TAKEOVER_DEADBAND = 0.02;
         const HAPTIC_PULSE_INTERVAL_MS = 80;
         const HAPTIC_PULSE_DURATION_MS = 90;
         const HAPTIC_FEEDBACK_MAX_AGE_MS = 250;
@@ -134,12 +134,12 @@
         const HOME_TAP_MAX_TRAVEL_M = 0.008;
         let wasAPressed = false;
         let wasBPressed = false;
-        let lastTriggerPosition = null;
+        let lastGripperAnalogPosition = null;
         let gripperTarget = null;
         let lastHapticPulseTime = 0;
-        let gripPressStartedAt = 0;
-        const gripPressStartPos = new THREE.Vector3();
-        let lastValidGripTapReleasedAt = -Infinity;
+        let motionPressStartedAt = 0;
+        const motionPressStartPos = new THREE.Vector3();
+        let lastValidMotionTapReleasedAt = -Infinity;
         let lastAutoHomeState = 'idle';
 
         init();
@@ -215,9 +215,9 @@
             }
         }
 
-        function updateWorkspaceHaptics(gamepad, gripPressed, timestamp) {
+        function updateWorkspaceHaptics(gamepad, motionClutchPressed, timestamp) {
             const feedback = window.latestWorkspaceFeedback;
-            if (!gamepad || !gripPressed || !feedback) return;
+            if (!gamepad || !motionClutchPressed || !feedback) return;
             if (performance.now() - feedback.receivedAtMs > HAPTIC_FEEDBACK_MAX_AGE_MS) return;
 
             const intensity = clamp(Number(feedback.haptic_intensity) || 0.0, 0.0, 1.0);
@@ -250,11 +250,9 @@
         }
 
         function renderFrame(timestamp, frame) {
-            console.log(`[${new Date().toLocaleString()}] Render!`);
-            console.time("Timer");
             let outVx = 0, outVy = 0, outVz = 0;
-            let gripPressed = false;
-            let triggerPosition = null;
+            let motionClutchPressed = false;
+            let gripperAnalogPosition = null;
             let aPressed = false;
             let bPressed = false;
             let rightGamepad = null;
@@ -274,10 +272,20 @@
 
                         const gp = source.gamepad;
                         rightGamepad = gp;
-                        const trigger = gp.buttons[QUEST_TRIGGER_BUTTON];
-                        const grip = gp.buttons[QUEST_GRIP_BUTTON];
-                        triggerPosition = clamp(trigger ? trigger.value : 0.0, 0.0, 1.0);
-                        gripPressed = !!(grip && grip.pressed);
+                        const triggerButton = gp.buttons[QUEST_TRIGGER_BUTTON];
+                        const squeezeButton = gp.buttons[QUEST_GRIP_BUTTON];
+
+                        // Index trigger: hold to engage Cartesian robot movement.
+                        motionClutchPressed = !!(
+                            triggerButton && triggerButton.pressed
+                        );
+
+                        // Side squeeze: analog 0..1 proportional gripper target.
+                        gripperAnalogPosition = clamp(
+                            squeezeButton ? squeezeButton.value : 0.0,
+                            0.0,
+                            1.0
+                        );
                         aPressed = !!(gp.buttons[QUEST_A_BUTTON] && gp.buttons[QUEST_A_BUTTON].pressed);
                         bPressed = !!(gp.buttons[QUEST_B_BUTTON] && gp.buttons[QUEST_B_BUTTON].pressed);
 
@@ -295,17 +303,19 @@
                     }
                 }
 
-                // The analog trigger owns the target whenever it physically moves.
-                // A/B steps persist while the trigger remains stationary.
+                // The analog side squeeze owns the target whenever it moves.
+                // A/B steps persist while the side squeeze remains stationary.
                 if (
-                    triggerPosition !== null
+                    gripperAnalogPosition !== null
                     && (
-                        lastTriggerPosition === null
-                        || Math.abs(triggerPosition - lastTriggerPosition) >= TRIGGER_TAKEOVER_DEADBAND
+                        lastGripperAnalogPosition === null
+                        || Math.abs(
+                            gripperAnalogPosition - lastGripperAnalogPosition
+                        ) >= GRIPPER_ANALOG_TAKEOVER_DEADBAND
                     )
                 ) {
-                    gripperTarget = triggerPosition;
-                    lastTriggerPosition = triggerPosition;
+                    gripperTarget = gripperAnalogPosition;
+                    lastGripperAnalogPosition = gripperAnalogPosition;
                 }
 
                 if (aPressed && !wasAPressed) {
@@ -319,14 +329,14 @@
                 wasAPressed = aPressed;
                 wasBPressed = bPressed;
 
-                if (gripPressed && !wasGripPressed) {
-                    gripPressStartedAt = timestamp;
-                    gripPressStartPos.copy(currentPos);
+                if (motionClutchPressed && !wasMotionClutchPressed) {
+                    motionPressStartedAt = timestamp;
+                    motionPressStartPos.copy(currentPos);
                 }
 
-                if (gripPressed) {
+                if (motionClutchPressed) {
                     msg_type = "XR"
-                    if (!wasGripPressed) {
+                    if (!wasMotionClutchPressed) {
                         engagePos.copy(currentPos);
                     }
 
@@ -347,45 +357,53 @@
                     lastDelta.set(0, 0, 0);
                 }
 
-                if (!gripPressed && wasGripPressed && rightControllerFound) {
-                    const pressDuration = timestamp - gripPressStartedAt;
-                    const handTravel = currentPos.distanceTo(gripPressStartPos);
+                if (
+                    !motionClutchPressed
+                    && wasMotionClutchPressed
+                    && rightControllerFound
+                ) {
+                    const pressDuration = timestamp - motionPressStartedAt;
+                    const handTravel = currentPos.distanceTo(motionPressStartPos);
                     const validTap =
                         pressDuration <= HOME_TAP_MAX_DURATION_MS
                         && handTravel <= HOME_TAP_MAX_TRAVEL_M;
 
                     if (validTap) {
                         if (
-                            timestamp - lastValidGripTapReleasedAt
+                            timestamp - lastValidMotionTapReleasedAt
                             <= HOME_DOUBLE_TAP_GAP_MS
                         ) {
                             homeRequestThisFrame = true;
-                            lastValidGripTapReleasedAt = -Infinity;
+                            lastValidMotionTapReleasedAt = -Infinity;
                             lastHapticPulseTime = timestamp;
                             playHapticPulse(rightGamepad, 1.0, 140);
                         } else {
-                            lastValidGripTapReleasedAt = timestamp;
+                            lastValidMotionTapReleasedAt = timestamp;
                         }
                     } else {
-                        lastValidGripTapReleasedAt = -Infinity;
+                        lastValidMotionTapReleasedAt = -Infinity;
                     }
                 }
 
                 if (!rightControllerFound) {
-                    lastValidGripTapReleasedAt = -Infinity;
+                    lastValidMotionTapReleasedAt = -Infinity;
                 }
 
-                wasGripPressed = gripPressed;
-                updateWorkspaceHaptics(rightGamepad, gripPressed, timestamp);
+                wasMotionClutchPressed = motionClutchPressed;
+                updateWorkspaceHaptics(
+                    rightGamepad,
+                    motionClutchPressed,
+                    timestamp
+                );
                 updateAutoHomeHaptics(rightGamepad, timestamp);
             } 
             // 2. If not in VR, check Desktop Keyboard Input
             else {
                 msg_type = "keyboard"
-                wasGripPressed = false;
+                wasMotionClutchPressed = false;
                 wasAPressed = false;
                 wasBPressed = false;
-                lastValidGripTapReleasedAt = -Infinity;
+                lastValidMotionTapReleasedAt = -Infinity;
                 if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
                 if (keys['Shift']) outVz = -1.0;    // 'S' = Backw / MAX_OFFSET_METERSard
                 if (keys['a']) outVy = 1.0;     // 'A' = Left
@@ -402,7 +420,7 @@
                     vy: outVy,
                     vz: outVz,
                     gripper_position: gripperTarget,
-                    grip_pressed: gripPressed,
+                    grip_pressed: motionClutchPressed,
                     home_request: homeRequestThisFrame,
                     xr_presenting: renderer.xr.isPresenting,
                     controller_present: rightControllerFound
@@ -423,22 +441,15 @@
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `VR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
-                    `Side grip clutch: ${gripPressed ? '<span class="ok">ENGAGED</span>' : 'released'}\n` +
-                    `Trigger position: ${triggerPosition === null ? 'unavailable' : triggerPosition.toFixed(2)}\n` +
+                    `Trigger movement clutch: ${motionClutchPressed ? '<span class="ok">ENGAGED</span>' : 'released'}\n` +
+                    `Side squeeze position: ${gripperAnalogPosition === null ? 'unavailable' : gripperAnalogPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Workspace: ${workspaceText}\n` +
                     `Auto-home: ${homeText}\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
             }
-
-            // renderer.render(scene, camera);
-            console.timeEnd("Timer"); 
         }
     </script>
 </body>
 </html>
-
-
-<!-- need to read the robot state repeatedly to use the position of the tool in order to get the position of the hand. I need to match the position of the robot to the hand
- with a PID or P control -->

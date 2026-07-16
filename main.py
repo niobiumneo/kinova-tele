@@ -1,16 +1,14 @@
-import cv2
 import json
-import threading
-from math import isfinite, sqrt
-from time import time
-import uvicorn
-import numpy as np
-import asyncio
+import os
+from contextlib import asynccontextmanager
 from copy import deepcopy
-import pyrealsense2 as rs
+from math import isfinite, sqrt
+from pathlib import Path
+from time import time
+import asyncio
+import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 
 # Pure Python Kinova Kortex API Imports
 from kortex_api.TCPTransport import TCPTransport
@@ -21,10 +19,11 @@ from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
 # --- CONFIGURATION ---
+APP_DIR = Path(__file__).resolve().parent
 ROBOT_IP = "192.168.1.10"
 ROBOT_PORT = 10000
-USERNAME = "admin"
-PASSWORD = "admin"
+USERNAME_ENV_VAR = "KINOVA_USERNAME"
+PASSWORD_ENV_VAR = "KINOVA_PASSWORD"
 
 # --- SAFETY SETTINGS ---
 VELOCITY_SCALE = 1.0
@@ -202,6 +201,14 @@ class KinovaController:
 
     def connect(self):
         try:
+            username = os.environ.get(USERNAME_ENV_VAR)
+            password = os.environ.get(PASSWORD_ENV_VAR)
+            if not username or not password:
+                raise RuntimeError(
+                    "Kinova credentials are not configured. Set "
+                    f"{USERNAME_ENV_VAR} and {PASSWORD_ENV_VAR} before startup."
+                )
+
             print(f"Connecting directly to Kinova Gen3 at {ROBOT_IP}...")
             self.transport = TCPTransport()
             error_callback = lambda kException: print(f"API Error: {kException}")
@@ -209,8 +216,8 @@ class KinovaController:
             self.transport.connect(ROBOT_IP, ROBOT_PORT)
 
             session_info = Session_pb2.CreateSessionInfo()
-            session_info.username = USERNAME
-            session_info.password = PASSWORD
+            session_info.username = username
+            session_info.password = password
             session_info.session_inactivity_timeout = 60000
             session_info.connection_inactivity_timeout = 2000
 
@@ -318,46 +325,63 @@ class KinovaController:
 robot = KinovaController()
 workspace = None
 home_pose = None
-app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(_app):
     global home_pose, workspace
     robot.connect()
     try:
-        initial_pose = deepcopy(robot.get_current_robot_pose())
-        workspace = PlanarWorkspace()
-        if not workspace.contains(initial_pose):
-            raise RuntimeError(
-                "tool is outside the configured X/Y workspace; "
-                f"tool=({initial_pose.tool_pose_x:.3f}, "
-                f"{initial_pose.tool_pose_y:.3f}) m, "
-                f"workspace={workspace.describe()}"
+        try:
+            initial_pose = deepcopy(robot.get_current_robot_pose())
+            workspace = PlanarWorkspace()
+            if not workspace.contains(initial_pose):
+                raise RuntimeError(
+                    "tool is outside the configured X/Y workspace; "
+                    f"tool=({initial_pose.tool_pose_x:.3f}, "
+                    f"{initial_pose.tool_pose_y:.3f}) m, "
+                    f"workspace={workspace.describe()}"
+                )
+            home_pose = deepcopy(initial_pose)
+            print(f"Planar workspace active: {workspace.describe()}")
+            print(
+                "Auto-home startup position: "
+                f"X={home_pose.tool_pose_x:.3f}, "
+                f"Y={home_pose.tool_pose_y:.3f}, "
+                f"Z={home_pose.tool_pose_z:.3f} m"
             )
-        home_pose = deepcopy(initial_pose)
-        print(f"Planar workspace latched: {workspace.describe()}")
-        print(
-            "Auto-home startup position: "
-            f"X={home_pose.tool_pose_x:.3f}, "
-            f"Y={home_pose.tool_pose_y:.3f}, "
-            f"Z={home_pose.tool_pose_z:.3f} m"
-        )
-    except Exception as e:
-        workspace = None
-        home_pose = None
-        print(f"Failed to latch planar workspace: {e}")
+        except Exception as e:
+            workspace = None
+            home_pose = None
+            print(f"Failed to initialize workspace: {e}")
+
+        yield
+    finally:
+        robot.stop()
 
 
-@app.on_event("shutdown")
-def on_shutdown():
-    robot.stop()
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
 async def get_index():
-    return FileResponse("index.html")
+    return FileResponse(APP_DIR / "index.html")
+
+
+@app.get("/static/three.module.js", include_in_schema=False)
+async def get_three_module():
+    return FileResponse(
+        APP_DIR / "three.module.js",
+        media_type="text/javascript",
+    )
+
+
+@app.get("/static/VRButton.js", include_in_schema=False)
+async def get_vr_button():
+    return FileResponse(
+        APP_DIR / "VRButton.js",
+        media_type="text/javascript",
+    )
 
 
 @app.websocket("/ws")
@@ -564,14 +588,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 def start_server():
-    """Runs the FastAPI server in a background thread."""
+    """Run the FastAPI teleoperation server."""
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=8000,
         log_level="error",
-        ssl_keyfile="key.pem",
-        ssl_certfile="cert.pem",
+        ssl_keyfile=str(APP_DIR / "key.pem"),
+        ssl_certfile=str(APP_DIR / "cert.pem"),
     )
 
 
@@ -584,239 +608,4 @@ if __name__ == "__main__":
     print(" (Advanced -> Proceed) BEFORE trying to enter AR.")
     print("=" * 50 + "\n")
 
-    # 1. Start FastAPI server in a background thread
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
-
-    # 2. Native RealSense Pipeline (Bypasses /dev/media0)
-    try:
-        pipeline = rs.pipeline()
-        config = rs.config()
-
-        # Enable the standard color stream
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        pipeline.start(config)
-
-        print("RealSense camera active! Press 'Q' in the window to exit.")
-
-        while True:
-            # Wait for a coherent frame from the camera
-            frames = pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-
-            if not color_frame:
-                continue
-
-            # Convert the RealSense frame to an array OpenCV can display
-            color_image = np.asanyarray(color_frame.get_data())
-
-            cv2.imshow("Host PC - RealSense View", color_image)
-
-            # Press 'q' to close the window
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-    except Exception as e:
-        print(f"\nRealSense Pipeline failed: {e}")
-        print("Check your USB cable! RealSense requires a fast USB 3.0 port.")
-    finally:
-        try:
-            pipeline.stop()
-        except Exception:
-            pass
-        cv2.destroyAllWindows()
-
-
-
-
-
-# keyboard in VR
-
-
-
-
-# import cv2
-# import json
-# import threading
-# import uvicorn
-# import numpy as np
-# import pyrealsense2 as rs
-# from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-# from fastapi.responses import FileResponse
-
-# # Pure Python Kinova Kortex API Imports
-# from kortex_api.TCPTransport import TCPTransport
-# from kortex_api.RouterClient import RouterClient
-# from kortex_api.SessionManager import SessionManager
-# from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-# from kortex_api.autogen.messages import Session_pb2, Base_pb2
-
-# # --- CONFIGURATION ---
-# ROBOT_IP = "192.168.1.10"
-# ROBOT_PORT = 10000
-# USERNAME = "admin"
-# PASSWORD = "admin"
-
-# # --- SAFETY SETTINGS ---
-# VELOCITY_SCALE = 1.0
-# MAX_VELOCITY = 0.15
-# REFERENCE_FRAME = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
-
-# class KinovaController:
-#     def __init__(self):
-#         self.transport = None
-#         self.router = None
-#         self.base = None
-#         self.session_manager = None
-
-#     def connect(self):
-#         try:
-#             print(f"Connecting directly to Kinova Gen3 at {ROBOT_IP}...")
-#             self.transport = TCPTransport()
-#             error_callback = lambda kException: print(f"API Error: {kException}")
-#             self.router = RouterClient(self.transport, error_callback)
-#             self.transport.connect(ROBOT_IP, ROBOT_PORT)
-
-#             session_info = Session_pb2.CreateSessionInfo()
-#             session_info.username = USERNAME
-#             session_info.password = PASSWORD
-#             session_info.session_inactivity_timeout = 60000
-#             session_info.connection_inactivity_timeout = 2000
-
-#             self.session_manager = SessionManager(self.router)
-#             self.session_manager.CreateSession(session_info)
-#             self.base = BaseClient(self.router)
-
-#             try:
-#                 self.base.ClearFaults()
-#             except Exception:
-#                 pass
-
-#             try:
-#                 servo_mode = Base_pb2.ServoingModeInformation()
-#                 servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
-#                 self.base.SetServoingMode(servo_mode)
-#                 print("Set to SINGLE_LEVEL_SERVOING.")
-#             except Exception as e:
-#                 print(f"SetServoingMode failed: {e}")
-
-#             print("Successfully linked to Kortex API. Robot Ready.")
-#         except Exception as e:
-#             print(f"Hardware connection failed: {e}")
-
-#     def send_planar_velocity(self, vx, vy):
-#         if not self.base:
-#             return
-
-#         safe_vx = max(-MAX_VELOCITY, min(MAX_VELOCITY, vx * VELOCITY_SCALE))
-#         safe_vy = max(-MAX_VELOCITY, min(MAX_VELOCITY, vy * VELOCITY_SCALE))
-#         print(f"Commanding -> X: {safe_vx:.4f} m/s | Y: {safe_vy:.4f} m/s", end="\r")
-
-#         command = Base_pb2.TwistCommand()
-#         command.reference_frame = REFERENCE_FRAME
-#         command.twist.linear_x = safe_vx
-#         command.twist.linear_y = safe_vy
-#         command.twist.linear_z = 0.0
-#         command.twist.angular_x = 0.0
-#         command.twist.angular_y = 0.0
-#         command.twist.angular_z = 0.0
-
-#         try:
-#             self.base.SendTwistCommand(command)
-#         except Exception as e:
-#             print(f"\nSendTwistCommand failed: {e}")
-
-#     def stop(self):
-#         if self.base:
-#             try:
-#                 self.base.Stop()
-#             except Exception:
-#                 pass
-
-# # Initialize Robot Controller
-# robot = KinovaController()
-# app = FastAPI()
-
-# @app.on_event("startup")
-# def on_startup():
-#     robot.connect()
-
-# @app.on_event("shutdown")
-# def on_shutdown():
-#     robot.stop()
-
-# @app.get("/")
-# async def get_index():
-#     return FileResponse("index.html")
-
-# @app.websocket("/ws")
-# async def websocket_endpoint(websocket: WebSocket):
-#     await websocket.accept()
-#     print("\n[WS] Quest 2 Client connected successfully!")
-#     try:
-#         while True:
-#             data = await websocket.receive_text()
-#             payload = json.loads(data)
-#             vx = payload.get("vx", 0.0)
-#             vy = payload.get("vy", 0.0)
-#             robot.send_planar_velocity(vx, vy)
-#     except WebSocketDisconnect:
-#         print("\n[WS] Client disconnected. Stopping robot.")
-#         robot.stop()
-#     except Exception as e:
-#         print(f"\n[WS] Handler error: {e}")
-#         robot.stop()
-
-# def start_server():
-#     """Runs the FastAPI server in a background thread."""
-#     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")
-
-
-# if __name__ == "__main__":
-#     local_ip = "192.168.1.70" 
-#     print("\n" + "=" * 50)
-#     print(f" SERVER RUNNING OFFLINE (PURE HTTP) ")
-#     print(f" Quest 2 Browser URL: http://{local_ip}:8000")
-#     print("=" * 50 + "\n")
-    
-#     # 1. Start FastAPI server in a background thread
-#     server_thread = threading.Thread(target=start_server, daemon=True)
-#     server_thread.start()
-
-#     # 2. Native RealSense Pipeline (Bypasses /dev/media0)
-#     try:
-#         pipeline = rs.pipeline()
-#         config = rs.config()
-        
-#         # Enable the standard color stream
-#         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-#         pipeline.start(config)
-        
-#         print("RealSense camera active! Press 'Q' in the window to exit.")
-        
-#         while True:
-#             # Wait for a coherent frame from the camera
-#             frames = pipeline.wait_for_frames()
-#             color_frame = frames.get_color_frame()
-            
-#             if not color_frame:
-#                 continue
-                
-#             # Convert the RealSense frame to an array OpenCV can display
-#             color_image = np.asanyarray(color_frame.get_data())
-            
-#             cv2.imshow("Host PC - RealSense View", color_image)
-            
-#             # Press 'q' to close the window
-#             if cv2.waitKey(1) & 0xFF == ord('q'):
-#                 break
-                
-#     except Exception as e:
-#         print(f"\nRealSense Pipeline failed: {e}")
-#         print("Check your USB cable! RealSense requires a fast USB 3.0 port.")
-#     finally:
-#         try:
-#             pipeline.stop()
-#         except:
-#             pass
-#         cv2.destroyAllWindows()
+    start_server()

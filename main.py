@@ -2,7 +2,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from math import isfinite
+from math import atan2, cos, degrees, isfinite, radians, sin, sqrt
 from pathlib import Path
 from threading import Lock
 from time import time
@@ -29,22 +29,27 @@ PASSWORD_ENV_VAR = "KINOVA_PASSWORD"
 # --- SAFETY SETTINGS ---
 VELOCITY_SCALE = 1.0
 MAX_VELOCITY = 0.15  # m/s, per axis. Keep this low until you've verified directions.
-# Change this line to set the origin to the robot's gripper
+# Keep twist commands in the base frame so they match the workspace coordinates.
 REFERENCE_FRAME = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
 
-# The robot base X/Y plane is assumed to be parallel to the work surface, with
-# +X pointing forward and Y running across the table. These fixed base-frame
-# coordinates put a 4 ft deep by 4 ft wide rectangle directly in front of the
-# base. Adjust X_MIN or Y_CENTER to match the real table before operating.
+# The robot base X/Y plane is assumed to be parallel to the work surface. At
+# startup, the current end-effector X/Y position becomes the center of a 4 ft
+# by 4 ft rectangle. This keeps the boundary tied to the physical starting
+# point instead of the base-frame origin.
 # This application-level limiter is not a safety-rated substitute for matching
 # Kortex protection zones or an external safety system.
 FEET_TO_METERS = 0.3048
 WORKSPACE_SIZE_X_M = 4.0 * FEET_TO_METERS
 WORKSPACE_SIZE_Y_M = 4.0 * FEET_TO_METERS
-WORKSPACE_X_MIN_M = 0.0
-WORKSPACE_Y_CENTER_M = 0.0
 WORKSPACE_SLOWDOWN_DISTANCE_M = 0.10
 WORKSPACE_HAPTIC_THRESHOLD_M = 0.10
+
+# Manual Cartesian motion holds the end-effector orientation captured at
+# startup. Linear X/Y/Z translation remains enabled. Angular velocity is in
+# degrees per second because that is what Kortex TwistCommand expects.
+ORIENTATION_HOLD_GAIN = 2.0
+ORIENTATION_HOLD_DEADBAND_DEG = 0.5
+MAX_ANGULAR_VELOCITY_DEG_S = 20.0
 
 # Kortex gripper positions are normalized: 0.0 is open and 1.0 is closed.
 GRIPPER_OPEN_POSITION = 0.0
@@ -96,16 +101,76 @@ def max_joint_error_degrees(current_angles, target_angles):
     )
 
 
+def quaternion_multiply(left, right):
+    """Multiply two quaternions stored as (w, x, y, z)."""
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return (
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    )
+
+
+def euler_xyz_degrees_to_quaternion(theta_x, theta_y, theta_z):
+    """Convert Kortex extrinsic X-Y-Z Euler angles to a quaternion."""
+    half_x = radians(theta_x) / 2.0
+    half_y = radians(theta_y) / 2.0
+    half_z = radians(theta_z) / 2.0
+    qx = (cos(half_x), sin(half_x), 0.0, 0.0)
+    qy = (cos(half_y), 0.0, sin(half_y), 0.0)
+    qz = (cos(half_z), 0.0, 0.0, sin(half_z))
+    return quaternion_multiply(qz, quaternion_multiply(qy, qx))
+
+
+def orientation_hold_velocity(pose, target_orientation_deg):
+    """Return a capped base-frame angular correction toward startup orientation."""
+    current = euler_xyz_degrees_to_quaternion(
+        pose.tool_pose_theta_x,
+        pose.tool_pose_theta_y,
+        pose.tool_pose_theta_z,
+    )
+    target = euler_xyz_degrees_to_quaternion(*target_orientation_deg)
+    current_conjugate = (current[0], -current[1], -current[2], -current[3])
+    error = quaternion_multiply(target, current_conjugate)
+
+    # q and -q describe the same orientation. Choose the shortest rotation.
+    if error[0] < 0.0:
+        error = tuple(-component for component in error)
+
+    vector_norm = sqrt(sum(component**2 for component in error[1:]))
+    if vector_norm < 1e-9:
+        return 0.0, 0.0, 0.0, 0.0
+
+    angle_deg = degrees(2.0 * atan2(vector_norm, clamp(error[0], -1.0, 1.0)))
+    if angle_deg <= ORIENTATION_HOLD_DEADBAND_DEG:
+        return 0.0, 0.0, 0.0, angle_deg
+
+    requested_speed = ORIENTATION_HOLD_GAIN * angle_deg
+    angular_speed = min(requested_speed, MAX_ANGULAR_VELOCITY_DEG_S)
+    scale = angular_speed / vector_norm
+    return (
+        error[1] * scale,
+        error[2] * scale,
+        error[3] * scale,
+        angle_deg,
+    )
+
+
 class PlanarWorkspace:
     """Server-side rectangular X/Y workspace constraint."""
 
-    def __init__(self):
+    def __init__(self, startup_pose):
+        half_x = WORKSPACE_SIZE_X_M / 2.0
         half_y = WORKSPACE_SIZE_Y_M / 2.0
 
-        self.x_min = WORKSPACE_X_MIN_M
-        self.x_max = WORKSPACE_X_MIN_M + WORKSPACE_SIZE_X_M
-        self.y_min = WORKSPACE_Y_CENTER_M - half_y
-        self.y_max = WORKSPACE_Y_CENTER_M + half_y
+        self.center_x = float(startup_pose.tool_pose_x)
+        self.center_y = float(startup_pose.tool_pose_y)
+        self.x_min = self.center_x - half_x
+        self.x_max = self.center_x + half_x
+        self.y_min = self.center_y - half_y
+        self.y_max = self.center_y + half_y
 
     def contains(self, pose):
         return (
@@ -176,10 +241,17 @@ class PlanarWorkspace:
             "haptic_intensity": haptic_intensity,
             "tool_x_m": pose.tool_pose_x,
             "tool_y_m": pose.tool_pose_y,
+            "workspace_center_x_m": self.center_x,
+            "workspace_center_y_m": self.center_y,
+            "workspace_x_min_m": self.x_min,
+            "workspace_x_max_m": self.x_max,
+            "workspace_y_min_m": self.y_min,
+            "workspace_y_max_m": self.y_max,
         }
 
     def describe(self):
         return (
+            f"startup center=({self.center_x:.3f}, {self.center_y:.3f}) m, "
             f"X=[{self.x_min:.3f}, {self.x_max:.3f}] m, "
             f"Y=[{self.y_min:.3f}, {self.y_max:.3f}] m"
         )
@@ -241,14 +313,37 @@ class KinovaController:
         except Exception as e:
             print(f"Hardware connection failed: {e}")
 
-    def send_cartesian_velocity(self, vx, vy, vz):
-        """Send a base-frame Cartesian twist after applying final speed caps."""
+    def send_cartesian_velocity(
+        self,
+        vx,
+        vy,
+        vz,
+        angular_x=0.0,
+        angular_y=0.0,
+        angular_z=0.0,
+    ):
+        """Send a capped base-frame Cartesian linear and angular twist."""
         if not self.base:
             return
 
         safe_vx = max(-MAX_VELOCITY, min(MAX_VELOCITY, vx * VELOCITY_SCALE))
         safe_vy = max(-MAX_VELOCITY, min(MAX_VELOCITY, vy * VELOCITY_SCALE))
         safe_vz = max(-MAX_VELOCITY, min(MAX_VELOCITY, vz * VELOCITY_SCALE))
+        safe_angular_x = clamp(
+            angular_x,
+            -MAX_ANGULAR_VELOCITY_DEG_S,
+            MAX_ANGULAR_VELOCITY_DEG_S,
+        )
+        safe_angular_y = clamp(
+            angular_y,
+            -MAX_ANGULAR_VELOCITY_DEG_S,
+            MAX_ANGULAR_VELOCITY_DEG_S,
+        )
+        safe_angular_z = clamp(
+            angular_z,
+            -MAX_ANGULAR_VELOCITY_DEG_S,
+            MAX_ANGULAR_VELOCITY_DEG_S,
+        )
 
         # print(
         #     f"Commanding -> X: {safe_vx:.4f} m/s | Y: {safe_vy:.4f} m/s | Z: {safe_vz:.4f} m/s",
@@ -260,9 +355,9 @@ class KinovaController:
         command.twist.linear_x = safe_vx
         command.twist.linear_y = safe_vy
         command.twist.linear_z = safe_vz
-        command.twist.angular_x = 0.0
-        command.twist.angular_y = 0.0
-        command.twist.angular_z = 0.0
+        command.twist.angular_x = safe_angular_x
+        command.twist.angular_y = safe_angular_y
+        command.twist.angular_z = safe_angular_z
 
         try:
             self.base.SendTwistCommand(command)
@@ -421,17 +516,18 @@ class KinovaController:
 robot = KinovaController()
 workspace = None
 home_joint_angles = None
+locked_orientation_deg = None
 
 
 @asynccontextmanager
 async def lifespan(_app):
-    global home_joint_angles, workspace
+    global home_joint_angles, locked_orientation_deg, workspace
     robot.connect()
     try:
         try:
             initial_pose, initial_joint_angles = robot.get_current_robot_state()
             initial_pose = deepcopy(initial_pose)
-            workspace = PlanarWorkspace()
+            workspace = PlanarWorkspace(initial_pose)
             if not workspace.contains(initial_pose):
                 raise RuntimeError(
                     "tool is outside the configured X/Y workspace; "
@@ -440,7 +536,18 @@ async def lifespan(_app):
                     f"workspace={workspace.describe()}"
                 )
             home_joint_angles = tuple(initial_joint_angles)
+            locked_orientation_deg = (
+                float(initial_pose.tool_pose_theta_x),
+                float(initial_pose.tool_pose_theta_y),
+                float(initial_pose.tool_pose_theta_z),
+            )
             print(f"Planar workspace active: {workspace.describe()}")
+            print(
+                "Manual Cartesian orientation lock: "
+                f"theta=({locked_orientation_deg[0]:.2f}, "
+                f"{locked_orientation_deg[1]:.2f}, "
+                f"{locked_orientation_deg[2]:.2f}) deg"
+            )
             print(
                 "Auto-home startup joint configuration: "
                 + ", ".join(
@@ -451,6 +558,7 @@ async def lifespan(_app):
         except Exception as e:
             workspace = None
             home_joint_angles = None
+            locked_orientation_deg = None
             print(f"Failed to initialize workspace: {e}")
 
         yield
@@ -482,12 +590,27 @@ async def get_vr_button():
     )
 
 
+@app.get("/static/ARButton.js", include_in_schema=False)
+async def get_ar_button():
+    return FileResponse(
+        APP_DIR / "ARButton.js",
+        media_type="text/javascript",
+    )
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("\n[WS] Quest client connected successfully!")
-    if workspace is None or home_joint_angles is None:
-        await websocket.close(code=1011, reason="Robot workspace is unavailable")
+    if (
+        workspace is None
+        or home_joint_angles is None
+        or locked_orientation_deg is None
+    ):
+        await websocket.close(
+            code=1011,
+            reason="Robot workspace or startup pose is unavailable",
+        )
         return
 
     ref_robot_pose = deepcopy(robot.get_current_robot_pose())
@@ -573,6 +696,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_joint_angles,
                     home_joint_angles,
                 )
+                (
+                    orientation_angular_x,
+                    orientation_angular_y,
+                    orientation_angular_z,
+                    orientation_error_deg,
+                ) = orientation_hold_velocity(pose, locked_orientation_deg)
+                orientation_twist = (
+                    orientation_angular_x,
+                    orientation_angular_y,
+                    orientation_angular_z,
+                )
 
                 if home_requested and not auto_home_active:
                     # Clear the last manual twist before handing control to the
@@ -644,7 +778,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         keyboard_vy,
                         keyboard_vz,
                     )
-                    robot.send_cartesian_velocity(*limited_twist)
+                    robot.send_cartesian_velocity(
+                        *limited_twist,
+                        *orientation_twist,
+                    )
                     if keyboard_motion_requested:
                         auto_home_state = "idle"
                 elif msg_type == "XR":
@@ -654,7 +791,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         and abs(vz) < 0.001
                     ):
                         ref_robot_pose = deepcopy(pose)
-                        robot.send_cartesian_velocity(0, 0, 0)
+                        robot.send_cartesian_velocity(
+                            0,
+                            0,
+                            0,
+                            *orientation_twist,
+                        )
                     else:
                         target_x, target_y = workspace.clamp_target(
                             ref_robot_pose.tool_pose_x + vz,
@@ -672,14 +814,23 @@ async def websocket_endpoint(websocket: WebSocket):
                             y_speed,
                             z_speed,
                         )
-                        robot.send_cartesian_velocity(*limited_twist)
+                        robot.send_cartesian_velocity(
+                            *limited_twist,
+                            *orientation_twist,
+                        )
                         auto_home_state = "idle"
                 else:
-                    robot.send_cartesian_velocity(0, 0, 0)
+                    robot.send_cartesian_velocity(
+                        0,
+                        0,
+                        0,
+                        *orientation_twist,
+                    )
 
                 feedback = workspace.feedback(pose)
                 feedback["auto_home_state"] = auto_home_state
                 feedback["auto_home_joint_error_deg"] = home_joint_error_deg
+                feedback["orientation_error_deg"] = orientation_error_deg
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

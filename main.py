@@ -44,12 +44,14 @@ WORKSPACE_SIZE_Y_M = 4.0 * FEET_TO_METERS
 WORKSPACE_SLOWDOWN_DISTANCE_M = 0.10
 WORKSPACE_HAPTIC_THRESHOLD_M = 0.10
 
-# Manual Cartesian motion holds the end-effector orientation captured at
-# startup. Linear X/Y/Z translation remains enabled. Angular velocity is in
-# degrees per second because that is what Kortex TwistCommand expects.
+# Manual Cartesian motion holds startup pitch/roll while the right joystick
+# adjusts base-frame yaw. Linear X/Y/Z translation remains enabled. Angular
+# velocity is in degrees per second because Kortex TwistCommand expects it.
 ORIENTATION_HOLD_GAIN = 2.0
 ORIENTATION_HOLD_DEADBAND_DEG = 0.5
 MAX_ANGULAR_VELOCITY_DEG_S = 20.0
+JOYSTICK_YAW_RATE_DEG_S = 10.0
+MAX_YAW_INTEGRATION_INTERVAL_S = 0.05
 
 # Kortex gripper positions are normalized: 0.0 is open and 1.0 is closed.
 GRIPPER_OPEN_POSITION = 0.0
@@ -71,6 +73,11 @@ AUTO_HOME_TIMEOUT_S = 30.0
 
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
+
+
+def wrap_degrees(angle):
+    """Wrap an angle to [-180, 180) degrees."""
+    return (angle + 180.0) % 360.0 - 180.0
 
 
 def finite_command_value(payload, key):
@@ -125,7 +132,7 @@ def euler_xyz_degrees_to_quaternion(theta_x, theta_y, theta_z):
 
 
 def orientation_hold_velocity(pose, target_orientation_deg):
-    """Return a capped base-frame angular correction toward startup orientation."""
+    """Return a capped base-frame angular correction toward the target orientation."""
     current = euler_xyz_degrees_to_quaternion(
         pose.tool_pose_theta_x,
         pose.tool_pose_theta_y,
@@ -516,12 +523,12 @@ class KinovaController:
 robot = KinovaController()
 workspace = None
 home_joint_angles = None
-locked_orientation_deg = None
+startup_orientation_deg = None
 
 
 @asynccontextmanager
 async def lifespan(_app):
-    global home_joint_angles, locked_orientation_deg, workspace
+    global home_joint_angles, startup_orientation_deg, workspace
     robot.connect()
     try:
         try:
@@ -536,7 +543,7 @@ async def lifespan(_app):
                     f"workspace={workspace.describe()}"
                 )
             home_joint_angles = tuple(initial_joint_angles)
-            locked_orientation_deg = (
+            startup_orientation_deg = (
                 float(initial_pose.tool_pose_theta_x),
                 float(initial_pose.tool_pose_theta_y),
                 float(initial_pose.tool_pose_theta_z),
@@ -544,9 +551,10 @@ async def lifespan(_app):
             print(f"Planar workspace active: {workspace.describe()}")
             print(
                 "Manual Cartesian orientation lock: "
-                f"theta=({locked_orientation_deg[0]:.2f}, "
-                f"{locked_orientation_deg[1]:.2f}, "
-                f"{locked_orientation_deg[2]:.2f}) deg"
+                f"theta=({startup_orientation_deg[0]:.2f}, "
+                f"{startup_orientation_deg[1]:.2f}, "
+                f"{startup_orientation_deg[2]:.2f}) deg; "
+                "right thumbstick yaw enabled"
             )
             print(
                 "Auto-home startup joint configuration: "
@@ -558,7 +566,7 @@ async def lifespan(_app):
         except Exception as e:
             workspace = None
             home_joint_angles = None
-            locked_orientation_deg = None
+            startup_orientation_deg = None
             print(f"Failed to initialize workspace: {e}")
 
         yield
@@ -605,7 +613,7 @@ async def websocket_endpoint(websocket: WebSocket):
     if (
         workspace is None
         or home_joint_angles is None
-        or locked_orientation_deg is None
+        or startup_orientation_deg is None
     ):
         await websocket.close(
             code=1011,
@@ -614,6 +622,8 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     ref_robot_pose = deepcopy(robot.get_current_robot_pose())
+    target_orientation_deg = list(startup_orientation_deg)
+    last_yaw_update_time = time()
     last_gripper_position = None
     last_gripper_command_time = 0.0
     try:
@@ -686,6 +696,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 vx = finite_command_value(payload, "vx")
                 vy = finite_command_value(payload, "vy")
                 vz = finite_command_value(payload, "vz")
+                yaw_input = clamp(
+                    finite_command_value(payload, "yaw_input"),
+                    -1.0,
+                    1.0,
+                )
                 grip_pressed = payload.get("grip_pressed") is True
                 home_requested = payload.get("home_request") is True
                 xr_presenting = payload.get("xr_presenting") is True
@@ -696,12 +711,39 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_joint_angles,
                     home_joint_angles,
                 )
+
+                now = time()
+                yaw_update_interval = clamp(
+                    now - last_yaw_update_time,
+                    0.0,
+                    MAX_YAW_INTEGRATION_INTERVAL_S,
+                )
+                last_yaw_update_time = now
+
+                if home_requested:
+                    # Joint auto-home returns to the complete startup pose.
+                    target_orientation_deg[:] = startup_orientation_deg
+                elif (
+                    not auto_home_active
+                    and msg_type == "XR"
+                    and grip_pressed
+                ):
+                    # Change only base-frame yaw. Startup pitch and roll remain
+                    # fixed so a correctly initialized tool stays parallel to
+                    # the working surface.
+                    target_orientation_deg[2] = wrap_degrees(
+                        target_orientation_deg[2]
+                        + yaw_input
+                        * JOYSTICK_YAW_RATE_DEG_S
+                        * yaw_update_interval
+                    )
+
                 (
                     orientation_angular_x,
                     orientation_angular_y,
                     orientation_angular_z,
                     orientation_error_deg,
-                ) = orientation_hold_velocity(pose, locked_orientation_deg)
+                ) = orientation_hold_velocity(pose, target_orientation_deg)
                 orientation_twist = (
                     orientation_angular_x,
                     orientation_angular_y,
@@ -757,6 +799,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     else:
                         auto_home_state = "cancelled"
                     robot.cancel_joint_home(auto_home_state)
+                    target_orientation_deg[:] = (
+                        startup_orientation_deg[0],
+                        startup_orientation_deg[1],
+                        wrap_degrees(float(pose.tool_pose_theta_z)),
+                    )
                     ref_robot_pose = deepcopy(pose)
                 elif auto_home_active:
                     action_state = robot.get_home_action_state()
@@ -764,6 +811,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         auto_home_active = False
                         auto_home_state = action_state
                         robot.finish_joint_home()
+                        if action_state == "complete":
+                            target_orientation_deg[:] = startup_orientation_deg
+                        else:
+                            target_orientation_deg[:] = (
+                                startup_orientation_deg[0],
+                                startup_orientation_deg[1],
+                                wrap_degrees(float(pose.tool_pose_theta_z)),
+                            )
                         ref_robot_pose = deepcopy(pose)
                     else:
                         auto_home_state = "moving"
@@ -831,6 +886,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 feedback["auto_home_state"] = auto_home_state
                 feedback["auto_home_joint_error_deg"] = home_joint_error_deg
                 feedback["orientation_error_deg"] = orientation_error_deg
+                feedback["orientation_target_yaw_deg"] = target_orientation_deg[2]
+                feedback["tool_yaw_deg"] = float(pose.tool_pose_theta_z)
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

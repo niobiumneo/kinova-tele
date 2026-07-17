@@ -34,8 +34,9 @@
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Workspace Limited)</h2>
         <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>XR passthrough:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
+        <p style="margin-top: 0; color: #66ff99; font-size: 14px;"><strong>Yaw:</strong> Hold INDEX TRIGGER and move the RIGHT THUMBSTICK left/right. Releasing the stick holds the new yaw; pitch and roll remain locked.</p>
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
-        <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup orientation is held, and the controller vibrates near an X/Y wall.</p>
+        <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup pitch/roll are held, and the controller vibrates near an X/Y wall.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
@@ -127,6 +128,11 @@
         const QUEST_GRIP_BUTTON = 1;
         const QUEST_A_BUTTON = 4;
         const QUEST_B_BUTTON = 5;
+        const QUEST_THUMBSTICK_X_AXIS = 2;
+        const QUEST_THUMBSTICK_FALLBACK_X_AXIS = 0;
+        const THUMBSTICK_DEADZONE = 0.18;
+        // Flip this to 1.0 if left/right feels reversed on the physical setup.
+        const QUEST_YAW_DIRECTION = -1.0;
         const GRIPPER_STEP = 0.10;
         const GRIPPER_ANALOG_TAKEOVER_DEADBAND = 0.02;
         const HAPTIC_PULSE_INTERVAL_MS = 80;
@@ -191,6 +197,21 @@
         }
 
         function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+        function applyAxisDeadzone(value, deadzone) {
+            if (!Number.isFinite(value)) return 0.0;
+            const magnitude = Math.abs(value);
+            if (magnitude <= deadzone) return 0.0;
+            return Math.sign(value) * (magnitude - deadzone) / (1.0 - deadzone);
+        }
+
+        function readRightThumbstickX(gamepad) {
+            if (!gamepad || !gamepad.axes) return 0.0;
+            const axisIndex = gamepad.axes.length > QUEST_THUMBSTICK_X_AXIS
+                ? QUEST_THUMBSTICK_X_AXIS
+                : QUEST_THUMBSTICK_FALLBACK_X_AXIS;
+            return Number(gamepad.axes[axisIndex]) || 0.0;
+        }
 
         function playHapticPulse(gamepad, intensity, durationMs) {
             try {
@@ -265,6 +286,8 @@
 
         function renderFrame(timestamp, frame) {
             let outVx = 0, outVy = 0, outVz = 0;
+            let rawYawAxis = 0.0;
+            let yawInput = 0.0;
             let motionClutchPressed = false;
             let gripperAnalogPosition = null;
             let aPressed = false;
@@ -293,6 +316,14 @@
                         motionClutchPressed = !!(
                             triggerButton && triggerButton.pressed
                         );
+
+                        rawYawAxis = readRightThumbstickX(gp);
+                        if (motionClutchPressed) {
+                            yawInput = QUEST_YAW_DIRECTION * applyAxisDeadzone(
+                                rawYawAxis,
+                                THUMBSTICK_DEADZONE
+                            );
+                        }
 
                         // Side squeeze: analog 0..1 proportional gripper target.
                         gripperAnalogPosition = clamp(
@@ -445,6 +476,7 @@
                     vx: outVx,
                     vy: outVy,
                     vz: outVz,
+                    yaw_input: yawInput,
                     gripper_position: gripperTarget,
                     grip_pressed: motionClutchPressed,
                     home_request: homeRequestThisFrame,
@@ -471,11 +503,13 @@
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `XR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
                     `Trigger movement clutch: ${motionClutchPressed ? '<span class="ok">ENGAGED</span>' : 'released'}\n` +
+                    `Right stick yaw: raw=${rawYawAxis.toFixed(2)}, command=${yawInput.toFixed(2)}\n` +
                     `Side squeeze position: ${gripperAnalogPosition === null ? 'unavailable' : gripperAnalogPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Workspace: ${workspaceText}\n` +
                     `Orientation hold error: ${workspaceFeedback ? (workspaceFeedback.orientation_error_deg || 0).toFixed(2) : 'waiting'} deg\n` +
+                    `Target yaw: ${workspaceFeedback ? (workspaceFeedback.orientation_target_yaw_deg || 0).toFixed(1) : 'waiting'} deg\n` +
                     `Auto-home: ${homeText}\n` +
                     `XR translation scale: ${VR_TRANSLATION_SCALE.toFixed(2)}x\n` +
                     `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;

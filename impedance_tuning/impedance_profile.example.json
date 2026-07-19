@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "name": "gen3-conservative",
+  "description": "Low-speed, one-centimeter Cartesian compliance profile for initial full Gen3 commissioning.",
+  "impedance": {
+    "mass_kg": [8.0, 8.0, 8.0],
+    "stiffness_n_m": [300.0, 300.0, 350.0],
+    "damping_n_s_m": [100.0, 100.0, 110.0],
+    "force_deadband_n": [2.0, 2.0, 2.0],
+    "force_axis_sign": [1.0, 1.0, 1.0],
+    "max_displacement_m": [0.01, 0.01, 0.01],
+    "max_velocity_m_s": 0.01,
+    "filter_cutoff_hz": 8.0,
+    "force_limit_n": 15.0,
+    "force_release_n": 8.0,
+    "contact_haptic_start_n": 2.0,
+    "contact_haptic_full_scale_n": 12.0,
+    "tare_samples": 30,
+    "tare_max_force_n": 6.0,
+    "min_dt_s": 0.001,
+    "max_dt_s": 0.05
+  },
+  "runtime": {
+    "enabled": true,
+    "wrench_frame": "base",
+    "tare_max_tool_speed_m_s": 0.01,
+    "tare_max_tool_angular_speed_deg_s": 1.0,
+    "tare_after_gripper_delay_s": 0.25
+  },
+  "tuning": {
+    "loop_hz": 40.0,
+    "plot_window_s": 15.0,
+    "max_loop_gap_s": 0.15,
+    "max_tcp_deviation_m": 0.04,
+    "max_orientation_deviation_deg": 8.0,
+    "max_test_velocity_m_s": 0.015,
+    "excitation_amplitude_m": 0.01,
+    "excitation_frequency_hz": 0.2,
+    "excitation_position_gain_s_inv": 1.5,
+    "nullspace_max_tcp_drift_m": 0.02,
+    "nullspace_max_orientation_drift_deg": 5.0,
+    "nullspace_max_joint_delta_deg": 30.0
+  }
+}

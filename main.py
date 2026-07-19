@@ -11,6 +11,16 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
+from impedance_tuning.impedance_controller import (
+    CartesianImpedanceConfig,
+    CartesianImpedanceController,
+)
+from impedance_tuning.impedance_profile import (
+    DEFAULT_PROFILE_FILENAME,
+    load_impedance_profile,
+    load_optional_impedance_profile,
+)
+
 # Pure Python Kinova Kortex API Imports
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.RouterClient import RouterClient
@@ -19,12 +29,81 @@ from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
+
+def environment_bool(name, default):
+    """Read a strict boolean environment setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+def environment_float(name, default):
+    """Read a finite floating-point environment setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return float(default)
+    value = float(raw_value)
+    if not isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
+
+
+def environment_int(name, default):
+    """Read an integer environment setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return int(default)
+    return int(raw_value)
+
+
+def environment_vector3(name, default):
+    """Read one scalar or a comma-separated X,Y,Z environment setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return tuple(float(value) for value in default)
+
+    values = tuple(float(value.strip()) for value in raw_value.split(","))
+    if len(values) == 1:
+        values *= 3
+    if len(values) != 3 or not all(isfinite(value) for value in values):
+        raise ValueError(f"{name} must contain one value or three finite values")
+    return values
+
 # --- CONFIGURATION ---
 APP_DIR = Path(__file__).resolve().parent
+IMPEDANCE_TUNING_DIR = APP_DIR / "impedance_tuning"
 ROBOT_IP = "192.168.1.10"
 ROBOT_PORT = 10000
 USERNAME_ENV_VAR = "KINOVA_USERNAME"
 PASSWORD_ENV_VAR = "KINOVA_PASSWORD"
+
+# The standalone tuner writes this JSON file. An explicit environment path is
+# required to exist; the default local filename is optional so existing setups
+# retain the historical built-in defaults until a profile is exported.
+IMPEDANCE_PROFILE_ENV_VAR = "KINOVA_IMPEDANCE_PROFILE"
+_profile_setting = os.environ.get(IMPEDANCE_PROFILE_ENV_VAR)
+if _profile_setting:
+    IMPEDANCE_PROFILE_PATH = Path(_profile_setting).expanduser()
+    if not IMPEDANCE_PROFILE_PATH.is_absolute():
+        IMPEDANCE_PROFILE_PATH = APP_DIR / IMPEDANCE_PROFILE_PATH
+    if not IMPEDANCE_PROFILE_PATH.exists():
+        raise FileNotFoundError(
+            f"{IMPEDANCE_PROFILE_ENV_VAR} does not exist: "
+            f"{IMPEDANCE_PROFILE_PATH}"
+        )
+    IMPEDANCE_PROFILE = load_impedance_profile(IMPEDANCE_PROFILE_PATH)
+    IMPEDANCE_PROFILE_LOADED = True
+else:
+    IMPEDANCE_PROFILE_PATH = IMPEDANCE_TUNING_DIR / DEFAULT_PROFILE_FILENAME
+    IMPEDANCE_PROFILE, IMPEDANCE_PROFILE_LOADED = (
+        load_optional_impedance_profile(IMPEDANCE_PROFILE_PATH)
+    )
 
 # --- SAFETY SETTINGS ---
 VELOCITY_SCALE = 1.0
@@ -62,13 +141,108 @@ GRIPPER_POSITION_DEADBAND = 0.02
 # If the WebSocket goes quiet (headset takes off, wifi hiccup, browser tab suspends)
 # for longer than this, we force-stop the robot even if we never got an explicit
 # zero command. The short queue-drain timeout keeps only the newest motion command
-# without conflating it with the actual motion watchdog duration.
+# and is separate from the motion watchdog timeout.
 QUEUE_DRAIN_TIMEOUT_S = 0.001
 MOTION_WATCHDOG_TIMEOUT_S = 0.1
 
 POSITION_GAIN = 2.0
 AUTO_HOME_MAX_JOINT_VELOCITY_DEG_S = 10.0
 AUTO_HOME_TIMEOUT_S = 30.0
+
+# The Python controller uses Kortex's computed external tool wrench in a
+# translational mass-spring-damper outer loop. It emits an additional
+# base-frame velocity that is merged with the nominal XR or keyboard command.
+# Pitch, roll, and yaw remain owned by the existing orientation controller.
+IMPEDANCE_ENABLED = environment_bool(
+    "KINOVA_IMPEDANCE_ENABLED",
+    IMPEDANCE_PROFILE.runtime.enabled,
+)
+IMPEDANCE_WRENCH_FRAME = os.environ.get(
+    "KINOVA_IMPEDANCE_WRENCH_FRAME",
+    IMPEDANCE_PROFILE.runtime.wrench_frame,
+).strip().lower()
+if IMPEDANCE_WRENCH_FRAME not in ("base", "tool"):
+    raise ValueError("KINOVA_IMPEDANCE_WRENCH_FRAME must be base or tool")
+IMPEDANCE_TARE_MAX_TOOL_SPEED_M_S = environment_float(
+    "KINOVA_IMPEDANCE_TARE_MAX_TOOL_SPEED_M_S",
+    IMPEDANCE_PROFILE.runtime.tare_max_tool_speed_m_s,
+)
+IMPEDANCE_TARE_MAX_TOOL_ANGULAR_SPEED_DEG_S = environment_float(
+    "KINOVA_IMPEDANCE_TARE_MAX_TOOL_ANGULAR_SPEED_DEG_S",
+    IMPEDANCE_PROFILE.runtime.tare_max_tool_angular_speed_deg_s,
+)
+IMPEDANCE_TARE_AFTER_GRIPPER_DELAY_S = environment_float(
+    "KINOVA_IMPEDANCE_TARE_AFTER_GRIPPER_DELAY_S",
+    IMPEDANCE_PROFILE.runtime.tare_after_gripper_delay_s,
+)
+if IMPEDANCE_TARE_MAX_TOOL_SPEED_M_S < 0.0:
+    raise ValueError("KINOVA_IMPEDANCE_TARE_MAX_TOOL_SPEED_M_S cannot be negative")
+if IMPEDANCE_TARE_MAX_TOOL_ANGULAR_SPEED_DEG_S < 0.0:
+    raise ValueError(
+        "KINOVA_IMPEDANCE_TARE_MAX_TOOL_ANGULAR_SPEED_DEG_S cannot be negative"
+    )
+if IMPEDANCE_TARE_AFTER_GRIPPER_DELAY_S < 0.0:
+    raise ValueError("KINOVA_IMPEDANCE_TARE_AFTER_GRIPPER_DELAY_S cannot be negative")
+IMPEDANCE_CONFIG = CartesianImpedanceConfig(
+    mass_kg=environment_vector3(
+        "KINOVA_IMPEDANCE_MASS_KG",
+        IMPEDANCE_PROFILE.impedance.mass_kg,
+    ),
+    stiffness_n_m=environment_vector3(
+        "KINOVA_IMPEDANCE_STIFFNESS_N_M",
+        IMPEDANCE_PROFILE.impedance.stiffness_n_m,
+    ),
+    damping_n_s_m=environment_vector3(
+        "KINOVA_IMPEDANCE_DAMPING_NS_M",
+        IMPEDANCE_PROFILE.impedance.damping_n_s_m,
+    ),
+    force_deadband_n=environment_vector3(
+        "KINOVA_IMPEDANCE_FORCE_DEADBAND_N",
+        IMPEDANCE_PROFILE.impedance.force_deadband_n,
+    ),
+    force_axis_sign=environment_vector3(
+        "KINOVA_IMPEDANCE_FORCE_SIGN",
+        IMPEDANCE_PROFILE.impedance.force_axis_sign,
+    ),
+    max_displacement_m=environment_vector3(
+        "KINOVA_IMPEDANCE_MAX_DISPLACEMENT_M",
+        IMPEDANCE_PROFILE.impedance.max_displacement_m,
+    ),
+    max_velocity_m_s=environment_float(
+        "KINOVA_IMPEDANCE_MAX_VELOCITY_M_S",
+        IMPEDANCE_PROFILE.impedance.max_velocity_m_s,
+    ),
+    filter_cutoff_hz=environment_float(
+        "KINOVA_IMPEDANCE_FILTER_CUTOFF_HZ",
+        IMPEDANCE_PROFILE.impedance.filter_cutoff_hz,
+    ),
+    force_limit_n=environment_float(
+        "KINOVA_IMPEDANCE_FORCE_LIMIT_N",
+        IMPEDANCE_PROFILE.impedance.force_limit_n,
+    ),
+    force_release_n=environment_float(
+        "KINOVA_IMPEDANCE_FORCE_RELEASE_N",
+        IMPEDANCE_PROFILE.impedance.force_release_n,
+    ),
+    contact_haptic_start_n=environment_float(
+        "KINOVA_IMPEDANCE_HAPTIC_START_N",
+        IMPEDANCE_PROFILE.impedance.contact_haptic_start_n,
+    ),
+    contact_haptic_full_scale_n=environment_float(
+        "KINOVA_IMPEDANCE_HAPTIC_FULL_SCALE_N",
+        IMPEDANCE_PROFILE.impedance.contact_haptic_full_scale_n,
+    ),
+    tare_samples=environment_int(
+        "KINOVA_IMPEDANCE_TARE_SAMPLES",
+        IMPEDANCE_PROFILE.impedance.tare_samples,
+    ),
+    tare_max_force_n=environment_float(
+        "KINOVA_IMPEDANCE_TARE_MAX_FORCE_N",
+        IMPEDANCE_PROFILE.impedance.tare_max_force_n,
+    ),
+    min_dt_s=IMPEDANCE_PROFILE.impedance.min_dt_s,
+    max_dt_s=IMPEDANCE_PROFILE.impedance.max_dt_s,
+)
 
 
 def clamp(value, lower, upper):
@@ -90,6 +264,68 @@ def finite_command_value(payload, key):
     except (TypeError, ValueError):
         return 0.0
     return value if isfinite(value) else 0.0
+
+
+def external_wrench_from_feedback(base_feedback):
+    """Read Kortex's computed tool wrench, rejecting missing or invalid fields."""
+    force_fields = (
+        "tool_external_wrench_force_x",
+        "tool_external_wrench_force_y",
+        "tool_external_wrench_force_z",
+    )
+    torque_fields = (
+        "tool_external_wrench_torque_x",
+        "tool_external_wrench_torque_y",
+        "tool_external_wrench_torque_z",
+    )
+    try:
+        force = tuple(float(getattr(base_feedback, name)) for name in force_fields)
+        torque = tuple(float(getattr(base_feedback, name)) for name in torque_fields)
+    except (AttributeError, TypeError, ValueError):
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), False
+
+    if not all(isfinite(value) for value in force + torque):
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), False
+
+    return force, torque, True
+
+
+def measured_tool_linear_speed(base_feedback):
+    """Return the measured Cartesian speed used to gate wrench taring."""
+    try:
+        velocity = (
+            float(base_feedback.tool_twist_linear_x),
+            float(base_feedback.tool_twist_linear_y),
+            float(base_feedback.tool_twist_linear_z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if not all(isfinite(value) for value in velocity):
+        return 0.0
+    return sqrt(sum(value * value for value in velocity))
+
+
+def measured_tool_angular_speed(base_feedback):
+    """Return measured angular speed used to reject moving tare samples."""
+    try:
+        velocity = (
+            float(base_feedback.tool_twist_angular_x),
+            float(base_feedback.tool_twist_angular_y),
+            float(base_feedback.tool_twist_angular_z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if not all(isfinite(value) for value in velocity):
+        return 0.0
+    return sqrt(sum(value * value for value in velocity))
+
+
+def add_linear_twists(nominal_twist, compliance_twist):
+    """Merge the operator and impedance velocities before safety limiting."""
+    return tuple(
+        nominal + compliance
+        for nominal, compliance in zip(nominal_twist, compliance_twist)
+    )
 
 
 def max_joint_error_degrees(current_angles, target_angles):
@@ -118,6 +354,21 @@ def quaternion_multiply(left, right):
         lw * ry - lx * rz + ly * rw + lz * rx,
         lw * rz + lx * ry - ly * rx + lz * rw,
     )
+
+
+def quaternion_rotate_vector(quaternion, vector):
+    """Rotate a tool-frame vector into the base frame."""
+    conjugate = (
+        quaternion[0],
+        -quaternion[1],
+        -quaternion[2],
+        -quaternion[3],
+    )
+    rotated = quaternion_multiply(
+        quaternion_multiply(quaternion, (0.0, *vector)),
+        conjugate,
+    )
+    return rotated[1], rotated[2], rotated[3]
 
 
 def euler_xyz_degrees_to_quaternion(theta_x, theta_y, theta_z):
@@ -563,6 +814,31 @@ async def lifespan(_app):
                     for index, angle in enumerate(home_joint_angles)
                 )
             )
+            if IMPEDANCE_PROFILE_LOADED:
+                print(
+                    "Impedance profile loaded: "
+                    f"{IMPEDANCE_PROFILE.name!r} from {IMPEDANCE_PROFILE_PATH}"
+                )
+            else:
+                print(
+                    "No impedance_tuning/impedance_profile.json found; using built-in "
+                    "impedance defaults."
+                )
+            if IMPEDANCE_ENABLED:
+                print(
+                    "Cartesian impedance outer loop enabled: "
+                    f"M={IMPEDANCE_CONFIG.mass_kg} kg, "
+                    f"K={IMPEDANCE_CONFIG.stiffness_n_m} N/m, "
+                    f"D={IMPEDANCE_CONFIG.damping_n_s_m} N*s/m, "
+                    f"force limit={IMPEDANCE_CONFIG.force_limit_n:.1f} N, "
+                    f"wrench frame={IMPEDANCE_WRENCH_FRAME}"
+                )
+                print(
+                    "Keep the tool unloaded and stationary with the motion "
+                    "clutch released while the external wrench is tared."
+                )
+            else:
+                print("Cartesian impedance outer loop disabled by environment.")
         except Exception as e:
             workspace = None
             home_joint_angles = None
@@ -626,6 +902,11 @@ async def websocket_endpoint(websocket: WebSocket):
     last_yaw_update_time = time()
     last_gripper_position = None
     last_gripper_command_time = 0.0
+    impedance_controller = CartesianImpedanceController(
+        IMPEDANCE_CONFIG,
+        enabled=IMPEDANCE_ENABLED,
+    )
+    last_impedance_update_time = time()
     try:
         last_motion_message_time = time()
         watchdog_stopped_motion = False
@@ -655,6 +936,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         auto_home_state = "cancelled"
                     else:
                         robot.send_cartesian_velocity(0, 0, 0)
+                    impedance_controller.reset_dynamics()
                     watchdog_stopped_motion = True
                 continue
             
@@ -711,6 +993,46 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_joint_angles,
                     home_joint_angles,
                 )
+                keyboard_motion_requested = (
+                    msg_type == "keyboard"
+                    and (
+                        abs(vx) >= 0.001
+                        or abs(vy) >= 0.001
+                        or abs(vz) >= 0.001
+                    )
+                )
+                external_force_n, external_torque_nm, wrench_available = (
+                    external_wrench_from_feedback(pose)
+                )
+                force_transform = None
+                if wrench_available and IMPEDANCE_WRENCH_FRAME == "tool":
+                    try:
+                        tool_angles_deg = (
+                            float(pose.tool_pose_theta_x),
+                            float(pose.tool_pose_theta_y),
+                            float(pose.tool_pose_theta_z),
+                        )
+                        if not all(isfinite(value) for value in tool_angles_deg):
+                            raise ValueError("invalid tool orientation feedback")
+                        tool_orientation = euler_xyz_degrees_to_quaternion(
+                            *tool_angles_deg
+                        )
+                        external_torque_nm = quaternion_rotate_vector(
+                            tool_orientation,
+                            external_torque_nm,
+                        )
+                        if not all(
+                            isfinite(value) for value in external_torque_nm
+                        ):
+                            raise ValueError("invalid transformed wrench feedback")
+                        force_transform = lambda force: quaternion_rotate_vector(
+                            tool_orientation,
+                            force,
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        external_force_n = (0.0, 0.0, 0.0)
+                        external_torque_nm = (0.0, 0.0, 0.0)
+                        wrench_available = False
 
                 now = time()
                 yaw_update_interval = clamp(
@@ -719,12 +1041,57 @@ async def websocket_endpoint(websocket: WebSocket):
                     MAX_YAW_INTEGRATION_INTERVAL_S,
                 )
                 last_yaw_update_time = now
+                impedance_dt_s = now - last_impedance_update_time
+                last_impedance_update_time = now
+                tare_allowed = (
+                    not grip_pressed
+                    and not keyboard_motion_requested
+                    and not auto_home_active
+                    and not home_requested
+                    and now - last_gripper_command_time
+                    >= IMPEDANCE_TARE_AFTER_GRIPPER_DELAY_S
+                    and measured_tool_linear_speed(pose)
+                    <= IMPEDANCE_TARE_MAX_TOOL_SPEED_M_S
+                    and measured_tool_angular_speed(pose)
+                    <= IMPEDANCE_TARE_MAX_TOOL_ANGULAR_SPEED_DEG_S
+                )
+                impedance_output = impedance_controller.update(
+                    external_force_n,
+                    impedance_dt_s,
+                    wrench_available=wrench_available,
+                    allow_tare=tare_allowed,
+                    allow_motion=not auto_home_active and not home_requested,
+                    allow_force_limit_release=(
+                        not grip_pressed and not keyboard_motion_requested
+                    ),
+                    force_transform=force_transform,
+                    velocity_limiter=lambda velocity: workspace.constrain_motion(
+                        pose,
+                        *velocity,
+                    ),
+                )
+                impedance_tare_pending = IMPEDANCE_ENABLED and (
+                    impedance_output.state
+                    in ("calibrating", "tare_force_too_high")
+                )
+                operator_motion_interlocked = (
+                    impedance_output.force_limit_active
+                    or impedance_tare_pending
+                )
+                if (
+                    auto_home_state
+                    in ("force_limited", "impedance_calibrating")
+                    and not auto_home_active
+                    and not operator_motion_interlocked
+                ):
+                    auto_home_state = "idle"
 
-                if home_requested:
+                if home_requested and not operator_motion_interlocked:
                     # Joint auto-home returns to the complete startup pose.
                     target_orientation_deg[:] = startup_orientation_deg
                 elif (
                     not auto_home_active
+                    and not operator_motion_interlocked
                     and msg_type == "XR"
                     and grip_pressed
                 ):
@@ -749,33 +1116,51 @@ async def websocket_endpoint(websocket: WebSocket):
                     orientation_angular_y,
                     orientation_angular_z,
                 )
+                if impedance_output.force_limit_active:
+                    # Do not keep driving toward an orientation target while
+                    # the contact-force interlock is active.
+                    orientation_twist = (0.0, 0.0, 0.0)
 
-                if home_requested and not auto_home_active:
+                if (
+                    home_requested
+                    and not auto_home_active
+                    and not operator_motion_interlocked
+                ):
                     # Clear the last manual twist before handing control to the
                     # high-level joint trajectory.
                     robot.send_cartesian_velocity(0, 0, 0)
+                    impedance_controller.reset_dynamics()
                     auto_home_active = robot.start_joint_home(home_joint_angles)
                     auto_home_state = robot.get_home_action_state()
                     if auto_home_active:
                         auto_home_started_at = time()
                     ref_robot_pose = deepcopy(pose)
+                elif (
+                    home_requested
+                    and not auto_home_active
+                    and impedance_output.force_limit_active
+                ):
+                    auto_home_state = "force_limited"
+                elif (
+                    home_requested
+                    and not auto_home_active
+                    and impedance_tare_pending
+                ):
+                    auto_home_state = "impedance_calibrating"
 
-                keyboard_motion_requested = (
-                    msg_type == "keyboard"
-                    and (
-                        abs(vx) >= 0.001
-                        or abs(vy) >= 0.001
-                        or abs(vz) >= 0.001
-                    )
-                )
                 cancel_auto_home = (
                     auto_home_active
-                    and not home_requested
                     and (
-                        grip_pressed
-                        or keyboard_motion_requested
-                        or not xr_presenting
-                        or not controller_present
+                        impedance_output.force_limit_active
+                        or (
+                            not home_requested
+                            and (
+                                grip_pressed
+                                or keyboard_motion_requested
+                                or not xr_presenting
+                                or not controller_present
+                            )
+                        )
                     )
                 )
                 auto_home_timed_out = (
@@ -792,13 +1177,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     or auto_home_left_workspace
                 ):
                     auto_home_active = False
-                    if auto_home_timed_out:
+                    if impedance_output.force_limit_active:
+                        auto_home_state = "force_limited"
+                    elif auto_home_timed_out:
                         auto_home_state = "timeout"
                     elif auto_home_left_workspace:
                         auto_home_state = "workspace_blocked"
                     else:
                         auto_home_state = "cancelled"
                     robot.cancel_joint_home(auto_home_state)
+                    impedance_controller.reset_dynamics()
                     target_orientation_deg[:] = (
                         startup_orientation_deg[0],
                         startup_orientation_deg[1],
@@ -811,6 +1199,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         auto_home_active = False
                         auto_home_state = action_state
                         robot.finish_joint_home()
+                        impedance_controller.reset_dynamics()
                         if action_state == "complete":
                             target_orientation_deg[:] = startup_orientation_deg
                         else:
@@ -824,14 +1213,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         auto_home_state = "moving"
 
                 elif msg_type == "keyboard":
-                    keyboard_vx = clamp(vx, -1.0, 1.0) * MAX_VELOCITY
-                    keyboard_vy = clamp(vy, -1.0, 1.0) * MAX_VELOCITY
-                    keyboard_vz = clamp(vz, -1.0, 1.0) * MAX_VELOCITY
+                    if operator_motion_interlocked:
+                        nominal_twist = (0.0, 0.0, 0.0)
+                    else:
+                        nominal_twist = (
+                            clamp(vx, -1.0, 1.0) * MAX_VELOCITY,
+                            clamp(vy, -1.0, 1.0) * MAX_VELOCITY,
+                            clamp(vz, -1.0, 1.0) * MAX_VELOCITY,
+                        )
+                    requested_twist = add_linear_twists(
+                        nominal_twist,
+                        impedance_output.compliance_velocity_m_s,
+                    )
                     limited_twist = workspace.constrain_motion(
                         pose,
-                        keyboard_vx,
-                        keyboard_vy,
-                        keyboard_vz,
+                        *requested_twist,
                     )
                     robot.send_cartesian_velocity(
                         *limited_twist,
@@ -840,18 +1236,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     if keyboard_motion_requested:
                         auto_home_state = "idle"
                 elif msg_type == "XR":
-                    if (
+                    if operator_motion_interlocked:
+                        # Drop the old hand-relative target. The force limit
+                        # or tare interlock requires the operator to release
+                        # the movement clutch before motion resumes.
+                        ref_robot_pose = deepcopy(pose)
+                        nominal_twist = (0.0, 0.0, 0.0)
+                    elif (
                         abs(vx) < 0.001
                         and abs(vy) < 0.001
                         and abs(vz) < 0.001
                     ):
                         ref_robot_pose = deepcopy(pose)
-                        robot.send_cartesian_velocity(
-                            0,
-                            0,
-                            0,
-                            *orientation_twist,
-                        )
+                        nominal_twist = (0.0, 0.0, 0.0)
                     else:
                         target_x, target_y = workspace.clamp_target(
                             ref_robot_pose.tool_pose_x + vz,
@@ -862,23 +1259,32 @@ async def websocket_endpoint(websocket: WebSocket):
                         x_speed = POSITION_GAIN * (target_x - pose.tool_pose_x)
                         y_speed = POSITION_GAIN * (target_y - pose.tool_pose_y)
                         z_speed = POSITION_GAIN * (target_z - pose.tool_pose_z)
-
-                        limited_twist = workspace.constrain_motion(
-                            pose,
-                            x_speed,
-                            y_speed,
-                            z_speed,
-                        )
-                        robot.send_cartesian_velocity(
-                            *limited_twist,
-                            *orientation_twist,
-                        )
+                        nominal_twist = (x_speed, y_speed, z_speed)
                         auto_home_state = "idle"
-                else:
+
+                    requested_twist = add_linear_twists(
+                        nominal_twist,
+                        impedance_output.compliance_velocity_m_s,
+                    )
+                    limited_twist = workspace.constrain_motion(
+                        pose,
+                        *requested_twist,
+                    )
                     robot.send_cartesian_velocity(
-                        0,
-                        0,
-                        0,
+                        *limited_twist,
+                        *orientation_twist,
+                    )
+                else:
+                    requested_twist = add_linear_twists(
+                        (0.0, 0.0, 0.0),
+                        impedance_output.compliance_velocity_m_s,
+                    )
+                    limited_twist = workspace.constrain_motion(
+                        pose,
+                        *requested_twist,
+                    )
+                    robot.send_cartesian_velocity(
+                        *limited_twist,
                         *orientation_twist,
                     )
 
@@ -888,6 +1294,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 feedback["orientation_error_deg"] = orientation_error_deg
                 feedback["orientation_target_yaw_deg"] = target_orientation_deg[2]
                 feedback["tool_yaw_deg"] = float(pose.tool_pose_theta_z)
+                feedback["external_torque_x_nm"] = external_torque_nm[0]
+                feedback["external_torque_y_nm"] = external_torque_nm[1]
+                feedback["external_torque_z_nm"] = external_torque_nm[2]
+                feedback["impedance_wrench_frame"] = IMPEDANCE_WRENCH_FRAME
+                feedback.update(impedance_output.feedback())
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

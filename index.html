@@ -37,6 +37,7 @@
         <p style="margin-top: 0; color: #66ff99; font-size: 14px;"><strong>Yaw:</strong> Hold INDEX TRIGGER and move the RIGHT THUMBSTICK left/right. Releasing the stick holds the new yaw; pitch and roll remain locked.</p>
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup pitch/roll are held, and the controller vibrates near an X/Y wall.</p>
+        <p style="margin-top: 0; color: #ffbb66; font-size: 14px;"><strong>Impedance:</strong> Keep the tool unloaded and still with the movement trigger released while the external wrench tares. Contact force adds compliant X/Y/Z motion and controller vibration. The operator-motion force limit clears only after releasing the trigger.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
@@ -247,10 +248,18 @@
 
         function updateWorkspaceHaptics(gamepad, motionClutchPressed, timestamp) {
             const feedback = window.latestWorkspaceFeedback;
-            if (!gamepad || !motionClutchPressed || !feedback) return;
+            if (!gamepad || !feedback) return;
             if (performance.now() - feedback.receivedAtMs > HAPTIC_FEEDBACK_MAX_AGE_MS) return;
 
-            const intensity = clamp(Number(feedback.haptic_intensity) || 0.0, 0.0, 1.0);
+            const workspaceIntensity = motionClutchPressed
+                ? clamp(Number(feedback.haptic_intensity) || 0.0, 0.0, 1.0)
+                : 0.0;
+            const contactIntensity = clamp(
+                Number(feedback.impedance_contact_haptic_intensity) || 0.0,
+                0.0,
+                1.0
+            );
+            const intensity = Math.max(workspaceIntensity, contactIntensity);
             if (intensity <= 0.0) return;
             if (timestamp - lastHapticPulseTime < HAPTIC_PULSE_INTERVAL_MS) return;
 
@@ -277,6 +286,8 @@
                 || state === 'timeout'
                 || state === 'aborted'
                 || state === 'workspace_blocked'
+                || state === 'force_limited'
+                || state === 'impedance_calibrating'
             ) {
                 lastHapticPulseTime = timestamp;
                 playHapticPulse(gamepad, 0.35, 80);
@@ -499,6 +510,25 @@
                 const homeText = workspaceFeedback
                     ? `${workspaceFeedback.auto_home_state || 'idle'} (${(workspaceFeedback.auto_home_joint_error_deg || 0).toFixed(1)} deg max joint error)`
                     : 'waiting for robot feedback';
+                const feedbackNumber = (key) => {
+                    if (!workspaceFeedback) return 0.0;
+                    const value = Number(workspaceFeedback[key]);
+                    return Number.isFinite(value) ? value : 0.0;
+                };
+                const impedanceIsTaring = workspaceFeedback
+                    && feedbackNumber('impedance_tare_samples_collected')
+                    < feedbackNumber('impedance_tare_samples_required');
+                const impedanceForcePrefix = impedanceIsTaring
+                    ? 'impedance_raw_force_'
+                    : 'impedance_external_force_';
+                const impedanceForceLabel = impedanceIsTaring ? 'raw' : 'compensated';
+                const impedanceText = workspaceFeedback
+                    ? `${workspaceFeedback.impedance_state || 'unknown'}${workspaceFeedback.impedance_force_limit_active ? ' (RELEASE TRIGGER TO CLEAR LIMIT)' : ''}\n` +
+                      `  ${impedanceForceLabel} force: X=${feedbackNumber(impedanceForcePrefix + 'x_n').toFixed(1)} N, Y=${feedbackNumber(impedanceForcePrefix + 'y_n').toFixed(1)} N, Z=${feedbackNumber(impedanceForcePrefix + 'z_n').toFixed(1)} N, norm=${feedbackNumber('impedance_force_norm_n').toFixed(1)} N\n` +
+                      `  compliance velocity: X=${feedbackNumber('impedance_velocity_x_m_s').toFixed(3)}, Y=${feedbackNumber('impedance_velocity_y_m_s').toFixed(3)}, Z=${feedbackNumber('impedance_velocity_z_m_s').toFixed(3)} m/s\n` +
+                      `  virtual displacement: X=${feedbackNumber('impedance_displacement_x_m').toFixed(3)}, Y=${feedbackNumber('impedance_displacement_y_m').toFixed(3)}, Z=${feedbackNumber('impedance_displacement_z_m').toFixed(3)} m\n` +
+                      `  tare: ${feedbackNumber('impedance_tare_samples_collected').toFixed(0)}/${feedbackNumber('impedance_tare_samples_required').toFixed(0)} samples; wrench: ${workspaceFeedback.impedance_wrench_available ? 'available' : 'unavailable'} (${workspaceFeedback.impedance_wrench_frame || 'unknown'} source, base control frame)`
+                    : 'waiting for robot feedback';
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
                     `XR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
@@ -508,6 +538,7 @@
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Workspace: ${workspaceText}\n` +
+                    `Impedance: ${impedanceText}\n` +
                     `Orientation hold error: ${workspaceFeedback ? (workspaceFeedback.orientation_error_deg || 0).toFixed(2) : 'waiting'} deg\n` +
                     `Target yaw: ${workspaceFeedback ? (workspaceFeedback.orientation_target_yaw_deg || 0).toFixed(1) : 'waiting'} deg\n` +
                     `Auto-home: ${homeText}\n` +

@@ -2,7 +2,3 @@ __pycache__/
 *.py[cod]
 key.pem
 cert.pem
-impedance_tuning/impedance_profile.json
-impedance_tuning/tuning_runs/
-impedance_tuning/simulation_runs/
-third_party/mujoco_menagerie/

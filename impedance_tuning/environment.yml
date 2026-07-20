@@ -1,9 +1,0 @@
-name: kinova-impedance-sim
-channels:
-  - conda-forge
-dependencies:
-  - python=3.11
-  - mujoco>=3.3
-  - numpy>=2.0
-  - matplotlib>=3.7
-  - git

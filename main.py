@@ -35,6 +35,10 @@ PASSWORD_ENV_VAR = "KINOVA_PASSWORD"
 # --- SAFETY SETTINGS ---
 VELOCITY_SCALE = 1.0
 MAX_VELOCITY = 0.15  # m/s, per axis. Keep this low until you've verified directions.
+# Quest hand-to-robot distance gain. For example, 3.0 maps 2 cm of hand
+# displacement to a 6 cm robot target displacement. Restart main.py after
+# changing this value.
+XR_TRANSLATION_GAIN = 2.0
 # Maximum hand-relative target displacement accepted from an XR client for one
 # clutch engagement. Translation gain changes distance, not this velocity cap.
 MAX_XR_TARGET_OFFSET_M = 0.15
@@ -281,6 +285,7 @@ class KinovaController:
         self._home_planned_duration_s = 0.0
         self._home_cancel_state = None
         self._home_notification_handle = None
+        self._latest_gripper_position = None
 
     def connect(self):
         try:
@@ -404,6 +409,9 @@ class KinovaController:
             raise RuntimeError("Kinova cyclic feedback is unavailable")
 
         feedback = self.baseCyclic.RefreshFeedback()
+        self._latest_gripper_position = self._normalized_gripper_position(
+            feedback
+        )
         joint_angles = tuple(
             float(actuator.position) for actuator in feedback.actuators
         )
@@ -414,6 +422,25 @@ class KinovaController:
         if not joint_angles:
             raise RuntimeError("Kinova returned no actuator feedback")
         return feedback.base, joint_angles, joint_velocities
+
+    @staticmethod
+    def _normalized_gripper_position(feedback):
+        """Return cyclic gripper feedback as a normalized 0..1 position."""
+        try:
+            motors = feedback.interconnect.gripper_feedback.motor
+            if not motors:
+                return None
+            position_percent = float(motors[0].position)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+
+        if not isfinite(position_percent):
+            return None
+        return clamp(position_percent / 100.0, 0.0, 1.0)
+
+    def get_current_gripper_position(self):
+        """Return the most recent normalized cyclic gripper position."""
+        return self._latest_gripper_position
 
     def get_current_robot_pose(self):
         pose, _joint_angles, _joint_velocities = self.get_current_robot_state()
@@ -859,9 +886,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 vy = finite_command_value(payload, "vy")
                 vz = finite_command_value(payload, "vz")
                 if msg_type == "XR":
-                    vx = clamp(vx, -MAX_XR_TARGET_OFFSET_M, MAX_XR_TARGET_OFFSET_M)
-                    vy = clamp(vy, -MAX_XR_TARGET_OFFSET_M, MAX_XR_TARGET_OFFSET_M)
-                    vz = clamp(vz, -MAX_XR_TARGET_OFFSET_M, MAX_XR_TARGET_OFFSET_M)
+                    vx = clamp(
+                        vx * XR_TRANSLATION_GAIN,
+                        -MAX_XR_TARGET_OFFSET_M,
+                        MAX_XR_TARGET_OFFSET_M,
+                    )
+                    vy = clamp(
+                        vy * XR_TRANSLATION_GAIN,
+                        -MAX_XR_TARGET_OFFSET_M,
+                        MAX_XR_TARGET_OFFSET_M,
+                    )
+                    vz = clamp(
+                        vz * XR_TRANSLATION_GAIN,
+                        -MAX_XR_TARGET_OFFSET_M,
+                        MAX_XR_TARGET_OFFSET_M,
+                    )
                 yaw_input = clamp(
                     finite_command_value(payload, "yaw_input"),
                     -1.0,
@@ -1137,6 +1176,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 feedback["orientation_error_deg"] = orientation_error_deg
                 feedback["orientation_target_yaw_deg"] = target_orientation_deg[2]
                 feedback["tool_yaw_deg"] = float(pose.tool_pose_theta_z)
+                feedback["gripper_position_feedback"] = (
+                    robot.get_current_gripper_position()
+                )
+                feedback["xr_translation_gain"] = XR_TRANSLATION_GAIN
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

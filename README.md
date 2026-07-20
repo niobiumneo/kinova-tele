@@ -7,12 +7,13 @@ Quest passthrough teleoperation for a Kinova Gen3 using the Kortex Python API.
 - Hold the right index trigger and move the controller to translate the robot.
 - While holding the trigger, move the right thumbstick left/right to change yaw.
 - Use the side squeeze for proportional gripper position; A/B step closed/open.
+- On desktop, press `E` to close or `Q` to open the gripper by 10% per
+  keypress. The first step starts from measured cyclic gripper feedback.
 - Double-tap the index trigger to return to the joint configuration captured
   when the server started. Press the trigger again to cancel auto-home.
-- Use the on-screen **Movement gain** slider to map small hand displacement to
-  larger robot displacement. The `0.5x` to `5x` value is saved in the browser
-  and takes effect on the next trigger press. It can also be selected with
-  `https://ROBOT-COMPUTER-IP:8000/?scale=3`.
+- Set `XR_TRANSLATION_GAIN` near the top of `main.py` to map small hand
+  displacement to larger robot displacement, then restart the server. For
+  example, `3.0` maps 2 cm of Quest movement to a 6 cm robot target.
 
 Movement gain changes target distance, not the robot's configured velocity
 limit. XR target offsets are capped at 15 cm per trigger engagement, Cartesian

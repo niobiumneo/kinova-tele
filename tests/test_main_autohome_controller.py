@@ -248,5 +248,36 @@ class WorkspaceToleranceTests(unittest.TestCase):
         self.assertTrue(workspace.contains(pose, tolerance_m=0.005))
 
 
+class GripperFeedbackTests(unittest.TestCase):
+    def test_gripper_feedback_is_normalized_from_percent(self):
+        feedback = types.SimpleNamespace(
+            interconnect=types.SimpleNamespace(
+                gripper_feedback=types.SimpleNamespace(
+                    motor=[types.SimpleNamespace(position=42.5)]
+                )
+            )
+        )
+        position = main.KinovaController._normalized_gripper_position(feedback)
+        self.assertEqual(position, 0.425)
+
+    def test_gripper_feedback_is_clamped_and_optional(self):
+        feedback = types.SimpleNamespace(
+            interconnect=types.SimpleNamespace(
+                gripper_feedback=types.SimpleNamespace(
+                    motor=[types.SimpleNamespace(position=120.0)]
+                )
+            )
+        )
+        self.assertEqual(
+            main.KinovaController._normalized_gripper_position(feedback),
+            1.0,
+        )
+        self.assertIsNone(
+            main.KinovaController._normalized_gripper_position(
+                types.SimpleNamespace()
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

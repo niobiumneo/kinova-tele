@@ -11,13 +11,6 @@
             pointer-events: none; max-width: 90vw;
         }
         #button-container { pointer-events: auto; }
-        #movement-scale-control {
-            display: inline-flex; align-items: center; gap: 8px;
-            margin-bottom: 10px; padding: 8px 10px; border-radius: 6px;
-            color: white; background: rgba(0,0,0,0.65); font-size: 13px;
-        }
-        #movement-scale { width: 180px; }
-        #movement-scale-value { min-width: 42px; color: #7CFC00; font-weight: bold; }
         #debug {
             margin-top: 12px; font-size: 12px; line-height: 1.4; color: #eee;
             background: rgba(0,0,0,0.6); padding: 8px 10px; border-radius: 6px;
@@ -43,19 +36,13 @@
         <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>XR passthrough:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
         <p style="margin-top: 0; color: #66ff99; font-size: 14px;"><strong>Yaw:</strong> Hold INDEX TRIGGER and move the RIGHT THUMBSTICK left/right. Releasing the stick holds the new yaw; pitch and roll remain locked.</p>
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
-        <p style="margin-top: 0; color: #ffaaee; font-size: 14px;"><strong>Movement gain:</strong> Increase the slider so a small hand displacement requests a larger robot displacement. A changed value takes effect on the next trigger press.</p>
+        <p style="margin-top: 0; color: #ffaaee; font-size: 14px;"><strong>Movement gain:</strong> Configured on the server in <code>main.py</code>; restart the server after changing it.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup pitch/roll are held, and the controller vibrates near an X/Y wall.</p>
-        <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
+        <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down), Q/E (Open/Close gripper)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
         
-        <div id="button-container" style="margin-top: 15px;">
-            <div id="movement-scale-control">
-                <label for="movement-scale">Movement gain</label>
-                <input id="movement-scale" type="range" min="0.5" max="5" step="0.25" value="2">
-                <span id="movement-scale-value">2.00×</span>
-            </div>
-        </div>
+        <div id="button-container" style="margin-top: 15px;"></div>
         <div id="debug">Waiting for XR or Keyboard Input...</div>
     </div>
 
@@ -109,58 +96,17 @@
 
         const xrStatusEl = document.getElementById('xr-status');
         const debugEl = document.getElementById('debug');
-        const movementScaleInput = document.getElementById('movement-scale');
-        const movementScaleValue = document.getElementById('movement-scale-value');
 
         let scene, camera, renderer;
-        const MIN_TRANSLATION_SCALE = 0.5;
-        const MAX_TRANSLATION_SCALE = 5.0;
-        const DEFAULT_TRANSLATION_SCALE = 2.0;
-        const TRANSLATION_SCALE_STORAGE_KEY = 'kinova-vr-translation-scale';
-        // The server independently applies the same per-clutch displacement cap.
+        // Raw hand displacement is bounded here. The server applies the
+        // configured movement gain and independently enforces its target cap.
         const MAX_OFFSET_METERS = 0.15;
 
-        function sanitizeTranslationScale(value) {
-            if (value === null || value === undefined || value === '') {
-                return DEFAULT_TRANSLATION_SCALE;
-            }
-            const parsed = Number(value);
-            if (!Number.isFinite(parsed)) return DEFAULT_TRANSLATION_SCALE;
-            return clamp(parsed, MIN_TRANSLATION_SCALE, MAX_TRANSLATION_SCALE);
-        }
-
-        function loadTranslationScale() {
-            const queryValue = new URLSearchParams(window.location.search).get('scale');
-            if (queryValue !== null) return sanitizeTranslationScale(queryValue);
-            try {
-                return sanitizeTranslationScale(
-                    window.localStorage.getItem(TRANSLATION_SCALE_STORAGE_KEY)
-                );
-            } catch (_) {
-                return DEFAULT_TRANSLATION_SCALE;
-            }
-        }
-
-        let vrTranslationScale = loadTranslationScale();
-        movementScaleInput.value = vrTranslationScale.toFixed(2);
-        movementScaleValue.textContent = `${vrTranslationScale.toFixed(2)}×`;
-        movementScaleInput.addEventListener('input', () => {
-            vrTranslationScale = sanitizeTranslationScale(movementScaleInput.value);
-            movementScaleValue.textContent = `${vrTranslationScale.toFixed(2)}×`;
-        });
-        movementScaleInput.addEventListener('change', () => {
-            try {
-                window.localStorage.setItem(
-                    TRANSLATION_SCALE_STORAGE_KEY,
-                    vrTranslationScale.toFixed(2)
-                );
-            } catch (_) {
-                // Persistence is optional; the current page still uses the value.
-            }
-        });
-
         // --- Keyboard State ---
-        const keys = { w: false, a: false, s: false, d: false, ' ': false, 'Shift': false };
+        const keys = {
+            w: false, a: false, s: false, d: false,
+            q: false, e: false, ' ': false, 'Shift': false
+        };
         window.addEventListener('keydown', (e) => { 
             const key = e.key.toLowerCase();
             if (keys.hasOwnProperty(key)) keys[key] = true; 
@@ -176,7 +122,6 @@
 
         // --- XR Controller Clutch State ---
         let wasMotionClutchPressed = false;
-        let activeTranslationScale = vrTranslationScale;
         const engagePos = new THREE.Vector3();
         const currentPos = new THREE.Vector3();
         let rightControllerFound = false;
@@ -201,6 +146,8 @@
         const HOME_TAP_MAX_TRAVEL_M = 0.008;
         let wasAPressed = false;
         let wasBPressed = false;
+        let wasKeyboardGripperOpenPressed = false;
+        let wasKeyboardGripperClosePressed = false;
         let lastGripperAnalogPosition = null;
         let gripperTarget = null;
         let lastHapticPulseTime = 0;
@@ -269,6 +216,29 @@
                 ? QUEST_THUMBSTICK_X_AXIS
                 : QUEST_THUMBSTICK_FALLBACK_X_AXIS;
             return Number(gamepad.axes[axisIndex]) || 0.0;
+        }
+
+        function readGripperFeedbackPosition() {
+            const feedback = window.latestWorkspaceFeedback;
+            if (!feedback) return null;
+            const position = feedback.gripper_position_feedback;
+            if (typeof position !== 'number' || !Number.isFinite(position)) {
+                return null;
+            }
+            return clamp(position, 0.0, 1.0);
+        }
+
+        function stepKeyboardGripper(direction) {
+            const startingPosition = gripperTarget === null
+                ? readGripperFeedbackPosition()
+                : gripperTarget;
+            if (startingPosition === null) return false;
+            gripperTarget = clamp(
+                startingPosition + direction * GRIPPER_STEP,
+                0.0,
+                1.0
+            );
+            return true;
         }
 
         function playHapticPulse(gamepad, intensity, durationMs) {
@@ -442,7 +412,6 @@
                     msg_type = "XR"
                     if (!wasMotionClutchPressed) {
                         engagePos.copy(currentPos);
-                        activeTranslationScale = vrTranslationScale;
                     }
 
                     const delta = currentPos.clone().sub(engagePos);
@@ -457,17 +426,17 @@
                     const robot_dy = delta.y;  // Move hand up -> robot slides up
 
                     outVx = clamp(
-                        robot_dx * activeTranslationScale,
+                        robot_dx,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
                     outVy = clamp(
-                        robot_dy * activeTranslationScale,
+                        robot_dy,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
                     outVz = clamp(
-                        robot_dz * activeTranslationScale,
+                        robot_dz,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
@@ -528,6 +497,22 @@
                 if (keys['d']) outVy = -1.0;     // D = base -Y (right)
                 if (keys['w']) outVx = 1.0;      // W = base +X (forward)
                 if (keys['s']) outVx = -1.0;     // S = base -X (backward)
+
+                const gripperOpenPressed = keys['q'];
+                const gripperClosePressed = keys['e'];
+                if (
+                    gripperClosePressed
+                    && !wasKeyboardGripperClosePressed
+                ) {
+                    stepKeyboardGripper(1.0);
+                } else if (
+                    gripperOpenPressed
+                    && !wasKeyboardGripperOpenPressed
+                ) {
+                    stepKeyboardGripper(-1.0);
+                }
+                wasKeyboardGripperOpenPressed = gripperOpenPressed;
+                wasKeyboardGripperClosePressed = gripperClosePressed;
             }
 
             // 3. Send commands over the network
@@ -569,11 +554,12 @@
                     `Side squeeze position: ${gripperAnalogPosition === null ? 'unavailable' : gripperAnalogPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
+                    `Gripper feedback: ${workspaceFeedback && typeof workspaceFeedback.gripper_position_feedback === 'number' ? workspaceFeedback.gripper_position_feedback.toFixed(2) : 'unavailable'}\n` +
                     `Workspace: ${workspaceText}\n` +
                     `Orientation hold error: ${workspaceFeedback ? (workspaceFeedback.orientation_error_deg || 0).toFixed(2) : 'waiting'} deg\n` +
                     `Target yaw: ${workspaceFeedback ? (workspaceFeedback.orientation_target_yaw_deg || 0).toFixed(1) : 'waiting'} deg\n` +
                     `Auto-home: ${homeText}\n` +
-                    `XR movement gain: configured=${vrTranslationScale.toFixed(2)}x active=${activeTranslationScale.toFixed(2)}x\n` +
+                    `XR movement gain: ${workspaceFeedback && typeof workspaceFeedback.xr_translation_gain === 'number' ? workspaceFeedback.xr_translation_gain.toFixed(2) : 'waiting'}x (server)\n` +
                     `Command payload: vx=${outVx.toFixed(3)} vy=${outVy.toFixed(3)} vz=${outVz.toFixed(3)}`;
             }
         }

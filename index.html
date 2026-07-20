@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Kinova XR Passthrough + Desktop Teleop (Tool Frame)</title>
+    <title>Kinova XR Passthrough + Desktop Teleop (Base Frame)</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <style>
         body { margin: 0; padding: 0; overflow: hidden; background-color: transparent; font-family: sans-serif; }
@@ -11,6 +11,13 @@
             pointer-events: none; max-width: 90vw;
         }
         #button-container { pointer-events: auto; }
+        #movement-scale-control {
+            display: inline-flex; align-items: center; gap: 8px;
+            margin-bottom: 10px; padding: 8px 10px; border-radius: 6px;
+            color: white; background: rgba(0,0,0,0.65); font-size: 13px;
+        }
+        #movement-scale { width: 180px; }
+        #movement-scale-value { min-width: 42px; color: #7CFC00; font-weight: bold; }
         #debug {
             margin-top: 12px; font-size: 12px; line-height: 1.4; color: #eee;
             background: rgba(0,0,0,0.6); padding: 8px 10px; border-radius: 6px;
@@ -36,12 +43,19 @@
         <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>XR passthrough:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
         <p style="margin-top: 0; color: #66ff99; font-size: 14px;"><strong>Yaw:</strong> Hold INDEX TRIGGER and move the RIGHT THUMBSTICK left/right. Releasing the stick holds the new yaw; pitch and roll remain locked.</p>
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
+        <p style="margin-top: 0; color: #ffaaee; font-size: 14px;"><strong>Movement gain:</strong> Increase the slider so a small hand displacement requests a larger robot displacement. A changed value takes effect on the next trigger press.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup pitch/roll are held, and the controller vibrates near an X/Y wall.</p>
         <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
         
-        <div id="button-container" style="margin-top: 15px;"></div>
+        <div id="button-container" style="margin-top: 15px;">
+            <div id="movement-scale-control">
+                <label for="movement-scale">Movement gain</label>
+                <input id="movement-scale" type="range" min="0.5" max="5" step="0.25" value="2">
+                <span id="movement-scale-value">2.00×</span>
+            </div>
+        </div>
         <div id="debug">Waiting for XR or Keyboard Input...</div>
     </div>
 
@@ -95,12 +109,55 @@
 
         const xrStatusEl = document.getElementById('xr-status');
         const debugEl = document.getElementById('debug');
+        const movementScaleInput = document.getElementById('movement-scale');
+        const movementScaleValue = document.getElementById('movement-scale-value');
 
         let scene, camera, renderer;
-        // 1.25 means 4 cm of Quest hand travel requests 5 cm of robot travel.
-        // The scaled target is still capped by MAX_OFFSET_METERS below.
-        const VR_TRANSLATION_SCALE = 1.25;
+        const MIN_TRANSLATION_SCALE = 0.5;
+        const MAX_TRANSLATION_SCALE = 5.0;
+        const DEFAULT_TRANSLATION_SCALE = 2.0;
+        const TRANSLATION_SCALE_STORAGE_KEY = 'kinova-vr-translation-scale';
+        // The server independently applies the same per-clutch displacement cap.
         const MAX_OFFSET_METERS = 0.15;
+
+        function sanitizeTranslationScale(value) {
+            if (value === null || value === undefined || value === '') {
+                return DEFAULT_TRANSLATION_SCALE;
+            }
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed)) return DEFAULT_TRANSLATION_SCALE;
+            return clamp(parsed, MIN_TRANSLATION_SCALE, MAX_TRANSLATION_SCALE);
+        }
+
+        function loadTranslationScale() {
+            const queryValue = new URLSearchParams(window.location.search).get('scale');
+            if (queryValue !== null) return sanitizeTranslationScale(queryValue);
+            try {
+                return sanitizeTranslationScale(
+                    window.localStorage.getItem(TRANSLATION_SCALE_STORAGE_KEY)
+                );
+            } catch (_) {
+                return DEFAULT_TRANSLATION_SCALE;
+            }
+        }
+
+        let vrTranslationScale = loadTranslationScale();
+        movementScaleInput.value = vrTranslationScale.toFixed(2);
+        movementScaleValue.textContent = `${vrTranslationScale.toFixed(2)}×`;
+        movementScaleInput.addEventListener('input', () => {
+            vrTranslationScale = sanitizeTranslationScale(movementScaleInput.value);
+            movementScaleValue.textContent = `${vrTranslationScale.toFixed(2)}×`;
+        });
+        movementScaleInput.addEventListener('change', () => {
+            try {
+                window.localStorage.setItem(
+                    TRANSLATION_SCALE_STORAGE_KEY,
+                    vrTranslationScale.toFixed(2)
+                );
+            } catch (_) {
+                // Persistence is optional; the current page still uses the value.
+            }
+        });
 
         // --- Keyboard State ---
         const keys = { w: false, a: false, s: false, d: false, ' ': false, 'Shift': false };
@@ -119,6 +176,7 @@
 
         // --- XR Controller Clutch State ---
         let wasMotionClutchPressed = false;
+        let activeTranslationScale = vrTranslationScale;
         const engagePos = new THREE.Vector3();
         const currentPos = new THREE.Vector3();
         let rightControllerFound = false;
@@ -275,6 +333,7 @@
             } else if (
                 state === 'cancelled'
                 || state === 'timeout'
+                || state === 'settle_timeout'
                 || state === 'aborted'
                 || state === 'workspace_blocked'
             ) {
@@ -383,30 +442,32 @@
                     msg_type = "XR"
                     if (!wasMotionClutchPressed) {
                         engagePos.copy(currentPos);
+                        activeTranslationScale = vrTranslationScale;
                     }
 
                     const delta = currentPos.clone().sub(engagePos);
                     lastDelta.copy(delta);
 
-                    // --- TOOL FRAME MAPPING ---
-                    // +Z is pointing straight out of the gripper.
-                    // Move XR hand away (negative Z delta) -> robot drives straight forward
+                    // --- QUEST HAND TO ROBOT BASE-FRAME MAPPING ---
+                    // Move the XR hand away (negative Quest Z) to request
+                    // robot-forward motion. The server maps these three hand
+                    // axes into base X/Y/Z.
                     const robot_dz = -delta.z; 
                     const robot_dx = delta.x;  // Move hand right -> robot slides right
                     const robot_dy = delta.y;  // Move hand up -> robot slides up
 
                     outVx = clamp(
-                        robot_dx * VR_TRANSLATION_SCALE,
+                        robot_dx * activeTranslationScale,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
                     outVy = clamp(
-                        robot_dy * VR_TRANSLATION_SCALE,
+                        robot_dy * activeTranslationScale,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
                     outVz = clamp(
-                        robot_dz * VR_TRANSLATION_SCALE,
+                        robot_dz * activeTranslationScale,
                         -MAX_OFFSET_METERS,
                         MAX_OFFSET_METERS
                     );
@@ -461,12 +522,12 @@
                 wasAPressed = false;
                 wasBPressed = false;
                 lastValidMotionTapReleasedAt = -Infinity;
-                if (keys[' ']) outVz = 1.0;     // 'W' = Forward out of gripper (Z in Tool Frame)
-                if (keys['Shift']) outVz = -1.0;    // 'S' = Backw / MAX_OFFSET_METERSard
-                if (keys['a']) outVy = 1.0;     // 'A' = Left
-                if (keys['d']) outVy = -1.0;    // 'D' = Right
-                if (keys['w']) outVx = 1.0;     // Space = Up (or modify based on your exact flange rotation)
-                if (keys['s']) outVx = -1.0;// Shift = Down
+                if (keys[' ']) outVz = 1.0;      // Space = base +Z (up)
+                if (keys['Shift']) outVz = -1.0; // Shift = base -Z (down)
+                if (keys['a']) outVy = 1.0;      // A = base +Y (left)
+                if (keys['d']) outVy = -1.0;     // D = base -Y (right)
+                if (keys['w']) outVx = 1.0;      // W = base +X (forward)
+                if (keys['s']) outVx = -1.0;     // S = base -X (backward)
             }
 
             // 3. Send commands over the network
@@ -497,7 +558,8 @@
                       `  bounds: X=[${workspaceFeedback.workspace_x_min_m.toFixed(3)}, ${workspaceFeedback.workspace_x_max_m.toFixed(3)}] m, Y=[${workspaceFeedback.workspace_y_min_m.toFixed(3)}, ${workspaceFeedback.workspace_y_max_m.toFixed(3)}] m`
                     : 'waiting for robot feedback';
                 const homeText = workspaceFeedback
-                    ? `${workspaceFeedback.auto_home_state || 'idle'} (${(workspaceFeedback.auto_home_joint_error_deg || 0).toFixed(1)} deg max joint error)`
+                    ? `${workspaceFeedback.auto_home_state || 'idle'} (${(workspaceFeedback.auto_home_joint_error_deg || 0).toFixed(1)} deg error, ${(workspaceFeedback.auto_home_max_joint_velocity_deg_s || 0).toFixed(2)} deg/s max speed)` +
+                      `${workspaceFeedback.auto_home_error ? `\n  ERROR: ${workspaceFeedback.auto_home_error}` : ''}`
                     : 'waiting for robot feedback';
                 debugEl.innerHTML =
                     `Input Source: <span class="ok">${source}</span>\n` +
@@ -511,8 +573,8 @@
                     `Orientation hold error: ${workspaceFeedback ? (workspaceFeedback.orientation_error_deg || 0).toFixed(2) : 'waiting'} deg\n` +
                     `Target yaw: ${workspaceFeedback ? (workspaceFeedback.orientation_target_yaw_deg || 0).toFixed(1) : 'waiting'} deg\n` +
                     `Auto-home: ${homeText}\n` +
-                    `XR translation scale: ${VR_TRANSLATION_SCALE.toFixed(2)}x\n` +
-                    `Command (-1..1): vx=${outVx.toFixed(2)} vy=${outVy.toFixed(2)} vz=${outVz.toFixed(2)}`;
+                    `XR movement gain: configured=${vrTranslationScale.toFixed(2)}x active=${activeTranslationScale.toFixed(2)}x\n` +
+                    `Command payload: vx=${outVx.toFixed(3)} vy=${outVy.toFixed(3)} vz=${outVz.toFixed(3)}`;
             }
         }
     </script>

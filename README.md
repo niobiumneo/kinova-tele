@@ -6,7 +6,7 @@ Quest passthrough teleoperation for a Kinova Gen3 using the Kortex Python API.
 
 - Hold the right index trigger and move the controller to translate the robot.
 - While holding the trigger, move the right thumbstick left/right to change yaw.
-- Use the side squeeze for proportional gripper position; A/B step closed/open.
+- In XR, press A/B to step the gripper closed/open by 10% per press.
 - On desktop, press `E` to close or `Q` to open the gripper by 10% per
   keypress. The first step starts from measured cyclic gripper feedback.
 - Double-tap the index trigger to return to the joint configuration captured

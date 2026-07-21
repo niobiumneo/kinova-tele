@@ -33,7 +33,7 @@
 
     <div id="overlay">
         <h2>Kinova Gen3 Teleop (Workspace Limited)</h2>
-        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>XR passthrough:</strong> Hold INDEX TRIGGER to move. SIDE SQUEEZE sets gripper position. A closes and B opens one step.</p>
+        <p style="margin-top: 5px; color: #00ffcc; font-size: 14px;"><strong>XR passthrough:</strong> Hold INDEX TRIGGER to move. A closes and B opens the gripper one step.</p>
         <p style="margin-top: 0; color: #66ff99; font-size: 14px;"><strong>Yaw:</strong> Hold INDEX TRIGGER and move the RIGHT THUMBSTICK left/right. Releasing the stick holds the new yaw; pitch and roll remain locked.</p>
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
         <p style="margin-top: 0; color: #ffaaee; font-size: 14px;"><strong>Movement gain:</strong> Configured on the server in <code>main.py</code>; restart the server after changing it.</p>
@@ -128,7 +128,6 @@
         let lastDelta = new THREE.Vector3();
         let debugThrottle = 0;
         const QUEST_TRIGGER_BUTTON = 0;
-        const QUEST_GRIP_BUTTON = 1;
         const QUEST_A_BUTTON = 4;
         const QUEST_B_BUTTON = 5;
         const QUEST_THUMBSTICK_X_AXIS = 2;
@@ -137,7 +136,6 @@
         // Flip this to 1.0 if left/right feels reversed on the physical setup.
         const QUEST_YAW_DIRECTION = -1.0;
         const GRIPPER_STEP = 0.10;
-        const GRIPPER_ANALOG_TAKEOVER_DEADBAND = 0.02;
         const HAPTIC_PULSE_INTERVAL_MS = 80;
         const HAPTIC_PULSE_DURATION_MS = 90;
         const HAPTIC_FEEDBACK_MAX_AGE_MS = 250;
@@ -148,7 +146,6 @@
         let wasBPressed = false;
         let wasKeyboardGripperOpenPressed = false;
         let wasKeyboardGripperClosePressed = false;
-        let lastGripperAnalogPosition = null;
         let gripperTarget = null;
         let lastHapticPulseTime = 0;
         let motionPressStartedAt = 0;
@@ -228,7 +225,7 @@
             return clamp(position, 0.0, 1.0);
         }
 
-        function stepKeyboardGripper(direction) {
+        function stepGripperTarget(direction) {
             const startingPosition = gripperTarget === null
                 ? readGripperFeedbackPosition()
                 : gripperTarget;
@@ -318,7 +315,6 @@
             let rawYawAxis = 0.0;
             let yawInput = 0.0;
             let motionClutchPressed = false;
-            let gripperAnalogPosition = null;
             let aPressed = false;
             let bPressed = false;
             let rightGamepad = null;
@@ -339,7 +335,6 @@
                         const gp = source.gamepad;
                         rightGamepad = gp;
                         const triggerButton = gp.buttons[QUEST_TRIGGER_BUTTON];
-                        const squeezeButton = gp.buttons[QUEST_GRIP_BUTTON];
 
                         // Index trigger: hold to engage Cartesian robot movement.
                         motionClutchPressed = !!(
@@ -354,12 +349,6 @@
                             );
                         }
 
-                        // Side squeeze: analog 0..1 proportional gripper target.
-                        gripperAnalogPosition = clamp(
-                            squeezeButton ? squeezeButton.value : 0.0,
-                            0.0,
-                            1.0
-                        );
                         aPressed = !!(gp.buttons[QUEST_A_BUTTON] && gp.buttons[QUEST_A_BUTTON].pressed);
                         bPressed = !!(gp.buttons[QUEST_B_BUTTON] && gp.buttons[QUEST_B_BUTTON].pressed);
 
@@ -377,27 +366,10 @@
                     }
                 }
 
-                // The analog side squeeze owns the target whenever it moves.
-                // A/B steps persist while the side squeeze remains stationary.
-                if (
-                    gripperAnalogPosition !== null
-                    && (
-                        lastGripperAnalogPosition === null
-                        || Math.abs(
-                            gripperAnalogPosition - lastGripperAnalogPosition
-                        ) >= GRIPPER_ANALOG_TAKEOVER_DEADBAND
-                    )
-                ) {
-                    gripperTarget = gripperAnalogPosition;
-                    lastGripperAnalogPosition = gripperAnalogPosition;
-                }
-
                 if (aPressed && !wasAPressed) {
-                    const currentTarget = gripperTarget === null ? 0.0 : gripperTarget;
-                    gripperTarget = clamp(currentTarget + GRIPPER_STEP, 0.0, 1.0);
+                    stepGripperTarget(1.0);
                 } else if (bPressed && !wasBPressed) {
-                    const currentTarget = gripperTarget === null ? 0.0 : gripperTarget;
-                    gripperTarget = clamp(currentTarget - GRIPPER_STEP, 0.0, 1.0);
+                    stepGripperTarget(-1.0);
                 }
 
                 wasAPressed = aPressed;
@@ -504,12 +476,12 @@
                     gripperClosePressed
                     && !wasKeyboardGripperClosePressed
                 ) {
-                    stepKeyboardGripper(1.0);
+                    stepGripperTarget(1.0);
                 } else if (
                     gripperOpenPressed
                     && !wasKeyboardGripperOpenPressed
                 ) {
-                    stepKeyboardGripper(-1.0);
+                    stepGripperTarget(-1.0);
                 }
                 wasKeyboardGripperOpenPressed = gripperOpenPressed;
                 wasKeyboardGripperClosePressed = gripperClosePressed;
@@ -551,7 +523,6 @@
                     `XR Presenting: ${renderer.xr.isPresenting ? 'yes' : 'no'}\n` +
                     `Trigger movement clutch: ${motionClutchPressed ? '<span class="ok">ENGAGED</span>' : 'released'}\n` +
                     `Right stick yaw: raw=${rawYawAxis.toFixed(2)}, command=${yawInput.toFixed(2)}\n` +
-                    `Side squeeze position: ${gripperAnalogPosition === null ? 'unavailable' : gripperAnalogPosition.toFixed(2)}\n` +
                     `A/B: ${aPressed ? 'A pressed' : bPressed ? 'B pressed' : 'released'}\n` +
                     `Gripper target: ${gripperTarget === null ? 'unchanged' : gripperTarget.toFixed(2)}\n` +
                     `Gripper feedback: ${workspaceFeedback && typeof workspaceFeedback.gripper_position_feedback === 'number' ? workspaceFeedback.gripper_position_feedback.toFixed(2) : 'unavailable'}\n` +

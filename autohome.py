@@ -79,3 +79,34 @@ def joint_velocities_are_settled(
     if not all(isfinite(value) for value in velocities):
         return False
     return all(abs(value) <= threshold for value in velocities)
+
+
+def resolve_home_request(last_request_id, request_id, request_pending):
+    """Consume a persistent browser request exactly once.
+
+    Modern clients send a monotonically increasing request ID and keep
+    ``request_pending`` true until the server acknowledges that ID. Clients
+    without an ID retain the older one-frame boolean behavior.
+    """
+    if isinstance(request_id, bool):
+        request_id = None
+
+    try:
+        numeric_id = float(request_id)
+        parsed_id = int(numeric_id)
+        valid_id = (
+            isfinite(numeric_id)
+            and numeric_id == parsed_id
+            and parsed_id >= 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        valid_id = False
+        parsed_id = None
+
+    pending = request_pending is True
+    if not valid_id:
+        return last_request_id, pending
+
+    if last_request_id is None:
+        return parsed_id, pending
+    return parsed_id, parsed_id != last_request_id

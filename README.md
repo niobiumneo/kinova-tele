@@ -11,6 +11,8 @@ Quest passthrough teleoperation for a Kinova Gen3 using the Kortex Python API.
   keypress. The first step starts from measured cyclic gripper feedback.
 - Double-tap the index trigger to return to the joint configuration captured
   when the server started. Press the trigger again to cancel auto-home.
+- On desktop, press `H` to request the same auto-home action. This is useful for
+  testing the robot action independently of Quest double-tap recognition.
 - Set `XR_TRANSLATION_GAIN` near the top of `main.py` to map small hand
   displacement to larger robot displacement, then restart the server. For
   example, `3.0` maps 2 cm of Quest movement to a 6 cm robot target.
@@ -24,6 +26,8 @@ through the centered 4 ft by 4 ft application workspace limiter.
 
 Auto-home stops live Cartesian commands, waits for three near-zero joint-speed
 samples, validates a conservative timed joint waypoint, and then executes it.
+Home requests remain pending until the server acknowledges them, so WebSocket
+queue draining cannot discard a one-frame double-tap signal.
 The headset debug overlay and terminal report the exact Kortex validation or
 abort reason if the action fails. An unchanged robot is treated as already
 home rather than as a trajectory error.

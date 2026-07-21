@@ -4,6 +4,7 @@ from autohome import (
     joint_velocities_are_settled,
     max_joint_error_degrees,
     plan_home_duration_seconds,
+    resolve_home_request,
     wrapped_joint_error_degrees,
 )
 
@@ -39,6 +40,28 @@ class AutoHomeMathTests(unittest.TestCase):
         self.assertFalse(joint_velocities_are_settled((0.1, 0.3), 2, 0.25))
         self.assertFalse(
             joint_velocities_are_settled((0.1, float("nan")), 2, 0.25)
+        )
+
+    def test_home_request_sequence_is_consumed_once(self):
+        last_id, requested = resolve_home_request(None, 0, False)
+        self.assertEqual((last_id, requested), (0, False))
+
+        last_id, requested = resolve_home_request(last_id, 1, True)
+        self.assertEqual((last_id, requested), (1, True))
+
+        last_id, requested = resolve_home_request(last_id, 1, True)
+        self.assertEqual((last_id, requested), (1, False))
+
+    def test_pending_first_request_survives_connection_start(self):
+        self.assertEqual(
+            resolve_home_request(None, 3, True),
+            (3, True),
+        )
+
+    def test_legacy_home_request_without_id_still_works(self):
+        self.assertEqual(
+            resolve_home_request(4, None, True),
+            (4, True),
         )
 
 

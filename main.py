@@ -15,6 +15,7 @@ from autohome import (
     joint_velocities_are_settled,
     max_joint_error_degrees,
     plan_home_duration_seconds,
+    resolve_home_request,
 )
 
 # Pure Python Kinova Kortex API Imports
@@ -811,8 +812,11 @@ async def websocket_endpoint(websocket: WebSocket):
         auto_home_settle_samples = 0
         auto_home_action_started_at = 0.0
         auto_home_action_timeout_s = 0.0
+        auto_home_requires_xr = False
+        last_home_request_id = None
         while True:
             data = None
+            queued_home_request_seen = False
             while True:
                 try:
                     check = await asyncio.wait_for(
@@ -820,6 +824,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         timeout=QUEUE_DRAIN_TIMEOUT_S,
                     )
                     data = check
+                    try:
+                        queued_payload = json.loads(check)
+                        queued_home_request_seen = (
+                            queued_home_request_seen
+                            or queued_payload.get("home_request") is True
+                        )
+                    except (AttributeError, json.JSONDecodeError):
+                        pass
                 except asyncio.TimeoutError:
                     break
 
@@ -846,6 +858,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             
             payload = json.loads(data)
+            if queued_home_request_seen:
+                payload["home_request"] = True
             msg_type = payload.get("msg", None)
 
             gripper_position = payload.get("gripper_position")
@@ -907,7 +921,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     1.0,
                 )
                 grip_pressed = payload.get("grip_pressed") is True
-                home_requested = payload.get("home_request") is True
+                last_home_request_id, home_requested = resolve_home_request(
+                    last_home_request_id,
+                    payload.get("home_request_id"),
+                    payload.get("home_request") is True,
+                )
                 xr_presenting = payload.get("xr_presenting") is True
                 controller_present = payload.get("controller_present") is True
                 (
@@ -960,12 +978,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
                 if home_requested and not auto_home_active:
+                    print(
+                        "\nAuto-home request received: "
+                        f"source={msg_type}, request_id={last_home_request_id}"
+                    )
                     # End live twist control first. The action starts only after
                     # cyclic feedback confirms several near-zero velocity samples.
                     robot.send_cartesian_velocity(0, 0, 0)
                     auto_home_active = robot.prepare_joint_home()
                     auto_home_state = robot.get_home_action_state()
                     if auto_home_active:
+                        auto_home_requires_xr = xr_presenting
                         auto_home_settle_started_at = now
                         auto_home_settle_samples = 0
                         auto_home_action_started_at = 0.0
@@ -986,8 +1009,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     and (
                         grip_pressed
                         or keyboard_motion_requested
-                        or not xr_presenting
-                        or not controller_present
+                        or (
+                            auto_home_requires_xr
+                            and (not xr_presenting or not controller_present)
+                        )
                     )
                 )
                 controller_home_state = robot.get_home_action_state()
@@ -1180,6 +1205,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     robot.get_current_gripper_position()
                 )
                 feedback["xr_translation_gain"] = XR_TRANSLATION_GAIN
+                feedback["home_request_ack_id"] = last_home_request_id
                 await websocket.send_json(feedback)
                 last_motion_message_time = time()
                 watchdog_stopped_motion = False

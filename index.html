@@ -38,7 +38,7 @@
         <p style="margin-top: 0; color: #66ddff; font-size: 14px;"><strong>Auto-home:</strong> Double-click INDEX TRIGGER to return every arm joint to the configuration captured at server startup. Press INDEX TRIGGER again to cancel. The gripper is unchanged.</p>
         <p style="margin-top: 0; color: #ffaaee; font-size: 14px;"><strong>Movement gain:</strong> Configured on the server in <code>main.py</code>; restart the server after changing it.</p>
         <p style="margin-top: 0; color: #ff88ff; font-size: 14px;"><strong>Workspace:</strong> A 4 ft × 4 ft X/Y area is centered on the end-effector position captured at server startup (±2 ft per axis). Z remains enabled, startup pitch/roll are held, and the controller vibrates near an X/Y wall.</p>
-        <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down), Q/E (Open/Close gripper)</p>
+        <p style="margin-top: 0; color: #ffcc00; font-size: 14px;"><strong>Desktop:</strong> W/S (Fwd/Back), A/D (Left/Right), Space/Shift (Up/Down), Q/E (Open/Close gripper), H (Auto-home)</p>
         <p id="ws-status" style="margin-top: 10px; font-size: 13px; font-weight: bold; color: orange;">WS: connecting...</p>
         <p id="xr-status" style="margin-top: 4px; font-size: 13px; font-weight: bold; color: orange;">XR: checking support...</p>
         
@@ -49,6 +49,7 @@
     <script>
         window.robotSocket = null;
         window.latestWorkspaceFeedback = null;
+        window.homeRequestAcknowledged = 0;
         const host = window.location.host;
         const wsStatusEl = document.getElementById('ws-status');
 
@@ -73,6 +74,13 @@
                         if (feedback.type === 'workspace') {
                             feedback.receivedAtMs = performance.now();
                             window.latestWorkspaceFeedback = feedback;
+                            if (
+                                Number.isSafeInteger(feedback.home_request_ack_id)
+                                && feedback.home_request_ack_id >= 0
+                            ) {
+                                window.homeRequestAcknowledged =
+                                    feedback.home_request_ack_id;
+                            }
                         }
                     } catch (_) {
                         // Ignore non-JSON or unrelated server messages.
@@ -105,7 +113,7 @@
         // --- Keyboard State ---
         const keys = {
             w: false, a: false, s: false, d: false,
-            q: false, e: false, ' ': false, 'Shift': false
+            q: false, e: false, h: false, ' ': false, 'Shift': false
         };
         window.addEventListener('keydown', (e) => { 
             const key = e.key.toLowerCase();
@@ -139,19 +147,21 @@
         const HAPTIC_PULSE_INTERVAL_MS = 80;
         const HAPTIC_PULSE_DURATION_MS = 90;
         const HAPTIC_FEEDBACK_MAX_AGE_MS = 250;
-        const HOME_TAP_MAX_DURATION_MS = 220;
-        const HOME_DOUBLE_TAP_GAP_MS = 350;
-        const HOME_TAP_MAX_TRAVEL_M = 0.008;
+        const HOME_TAP_MAX_DURATION_MS = 350;
+        const HOME_DOUBLE_TAP_GAP_MS = 500;
+        const HOME_TAP_MAX_TRAVEL_M = 0.020;
         let wasAPressed = false;
         let wasBPressed = false;
         let wasKeyboardGripperOpenPressed = false;
         let wasKeyboardGripperClosePressed = false;
+        let wasKeyboardHomePressed = false;
         let gripperTarget = null;
         let lastHapticPulseTime = 0;
         let motionPressStartedAt = 0;
         const motionPressStartPos = new THREE.Vector3();
         let lastValidMotionTapReleasedAt = -Infinity;
         let lastAutoHomeState = 'idle';
+        let homeRequestSequence = 0;
 
         init();
 
@@ -318,7 +328,6 @@
             let aPressed = false;
             let bPressed = false;
             let rightGamepad = null;
-            let homeRequestThisFrame = false;
             let msg_type = "keyboard";
             rightControllerFound = false;
 
@@ -432,7 +441,7 @@
                             timestamp - lastValidMotionTapReleasedAt
                             <= HOME_DOUBLE_TAP_GAP_MS
                         ) {
-                            homeRequestThisFrame = true;
+                            homeRequestSequence += 1;
                             lastValidMotionTapReleasedAt = -Infinity;
                             lastHapticPulseTime = timestamp;
                             playHapticPulse(rightGamepad, 1.0, 140);
@@ -485,9 +494,21 @@
                 }
                 wasKeyboardGripperOpenPressed = gripperOpenPressed;
                 wasKeyboardGripperClosePressed = gripperClosePressed;
+
+                const keyboardHomePressed = keys['h'];
+                if (keyboardHomePressed && !wasKeyboardHomePressed) {
+                    homeRequestSequence += 1;
+                }
+                wasKeyboardHomePressed = keyboardHomePressed;
             }
 
             // 3. Send commands over the network
+            const acknowledgedHomeRequest = Number.isSafeInteger(
+                window.homeRequestAcknowledged
+            ) ? window.homeRequestAcknowledged : 0;
+            const homeRequestPending = (
+                homeRequestSequence > acknowledgedHomeRequest
+            );
             if (window.robotSocket && window.robotSocket.readyState === WebSocket.OPEN) {
                 window.robotSocket.send(JSON.stringify({
                     msg: msg_type,
@@ -497,7 +518,8 @@
                     yaw_input: yawInput,
                     gripper_position: gripperTarget,
                     grip_pressed: motionClutchPressed,
-                    home_request: homeRequestThisFrame,
+                    home_request: homeRequestPending,
+                    home_request_id: homeRequestSequence,
                     xr_presenting: renderer.xr.isPresenting,
                     controller_present: rightControllerFound
                 }));
@@ -530,6 +552,7 @@
                     `Orientation hold error: ${workspaceFeedback ? (workspaceFeedback.orientation_error_deg || 0).toFixed(2) : 'waiting'} deg\n` +
                     `Target yaw: ${workspaceFeedback ? (workspaceFeedback.orientation_target_yaw_deg || 0).toFixed(1) : 'waiting'} deg\n` +
                     `Auto-home: ${homeText}\n` +
+                    `Home request: id=${homeRequestSequence} ack=${acknowledgedHomeRequest} pending=${homeRequestPending ? 'yes' : 'no'}\n` +
                     `XR movement gain: ${workspaceFeedback && typeof workspaceFeedback.xr_translation_gain === 'number' ? workspaceFeedback.xr_translation_gain.toFixed(2) : 'waiting'}x (server)\n` +
                     `Command payload: vx=${outVx.toFixed(3)} vy=${outVy.toFixed(3)} vz=${outVz.toFixed(3)}`;
             }
